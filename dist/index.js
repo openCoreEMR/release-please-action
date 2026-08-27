@@ -50240,6 +50240,7 @@ const setup_cfg_1 = __nccwpck_require__(66832);
 const setup_py_1 = __nccwpck_require__(64387);
 const pyproject_toml_1 = __nccwpck_require__(7283);
 const python_file_with_version_1 = __nccwpck_require__(85487);
+const uv_lock_1 = __nccwpck_require__(73759);
 const errors_1 = __nccwpck_require__(88302);
 const filter_commits_1 = __nccwpck_require__(53380);
 const CHANGELOG_SECTIONS = [
@@ -50311,6 +50312,11 @@ class Python extends base_1.BaseStrategy {
             this.logger.warn('No project/component found.');
         }
         else {
+            updates.push({
+                path: this.addPath('uv.lock'),
+                createIfMissing: false,
+                updater: new uv_lock_1.UvLock({ packageName: projectName, version }),
+            });
             [projectName, projectName.replace(/-/g, '_')]
                 .flatMap(packageName => [
                 `${packageName}/__init__.py`,
@@ -53370,6 +53376,114 @@ class SetupPy extends default_1.DefaultUpdater {
 }
 exports.SetupPy = SetupPy;
 //# sourceMappingURL=setup-py.js.map
+
+/***/ }),
+
+/***/ 73759:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.UvLock = void 0;
+const TOML = __nccwpck_require__(64572);
+const toml_edit_1 = __nccwpck_require__(78170);
+const logger_1 = __nccwpck_require__(4493);
+function parseUvLockfile(content) {
+    return TOML.parse(content);
+}
+/**
+ * Normalizes a Python package name per PEP 503: lowercased, with runs of
+ * `-`, `_`, or `.` collapsed to a single `-`.
+ */
+function normalizePackageName(name) {
+    return name.toLowerCase().replace(/[-_.]+/g, '-');
+}
+/**
+ * Updates `uv.lock` lockfiles, preserving formatting and comments.
+ *
+ * Note: the content is parsed twice — once here to find the matching package
+ * index, and again inside `replaceTomlValue` (which uses a position-tracking
+ * parser for byte-accurate string splicing). This is inherent to the
+ * `replaceTomlValue` API design and is consistent with how `CargoLock` works.
+ */
+class UvLock {
+    constructor(options) {
+        this.packageName = options.packageName;
+        this.version = options.version;
+    }
+    /**
+     * Given initial file contents, return updated contents.
+     * @param {string} content The initial content
+     * @returns {string} The updated content
+     */
+    updateContent(content, logger = logger_1.logger) {
+        let payload = content;
+        const parsed = parseUvLockfile(payload);
+        if (!parsed.package) {
+            // Unlike CargoLock (which throws here), we only warn. A uv.lock without
+            // [[package]] entries can exist for a freshly-initialized project before
+            // its first `uv lock` run; crashing the release would be unhelpful.
+            logger.warn('uv.lock has no [[package]] entries');
+            return payload;
+        }
+        const normalizedTarget = normalizePackageName(this.packageName);
+        // n.b for `replaceTomlValue`, we need to keep track of the index
+        // (position) of the package we're considering.
+        let foundVersioned = false;
+        let foundVersionless = false;
+        for (let i = 0; i < parsed.package.length; i++) {
+            const pkg = parsed.package[i];
+            if (!pkg.name) {
+                continue;
+            }
+            if (normalizePackageName(pkg.name) !== normalizedTarget) {
+                continue;
+            }
+            if (!pkg.version) {
+                // Virtual packages (workspace members without a version) have no
+                // `version` field; record that we found the package but cannot bump it.
+                foundVersionless = true;
+                continue;
+            }
+            // note: in ECMAScript, using strings to index arrays is perfectly valid,
+            // which is lucky because `replaceTomlValue` expects "all strings" in its
+            // `path` argument.
+            const packageIndex = i.toString();
+            foundVersioned = true;
+            logger.info(`updating ${pkg.name} in uv.lock`);
+            // Note: replaceTomlValue may throw if the lockfile is structurally
+            // malformed (e.g., the `version` field is not a plain string). This is
+            // consistent with the CargoLock updater and is intentional — a corrupt
+            // lockfile should surface as an error rather than be silently skipped.
+            payload = (0, toml_edit_1.replaceTomlValue)(payload, ['package', packageIndex, 'version'], this.version.toString());
+        }
+        if (!foundVersioned) {
+            if (foundVersionless) {
+                logger.warn(`${this.packageName} is in uv.lock but has no version field (virtual package); skipping`);
+            }
+            else {
+                logger.warn(`package ${this.packageName} not found in uv.lock`);
+            }
+        }
+        return payload;
+    }
+}
+exports.UvLock = UvLock;
+//# sourceMappingURL=uv-lock.js.map
 
 /***/ }),
 
