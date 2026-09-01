@@ -4187,7 +4187,7 @@ class BranchFileCache {
         const treeEntries = await this.getFullTree();
         if (treeEntries) {
             const found = treeEntries.find(entry => entry.path === path);
-            if (found === null || found === void 0 ? void 0 : found.sha) {
+            if ((found === null || found === void 0 ? void 0 : found.sha) && !isGitSubmodule(found)) {
                 return await this.fetchContents(found.sha, found);
             }
             throw new FileNotFoundError(path);
@@ -4199,7 +4199,7 @@ class BranchFileCache {
         for (const part of parts) {
             const { tree } = await this.getTree(treeSha);
             found = tree.find(item => item.path === part);
-            if (!(found === null || found === void 0 ? void 0 : found.sha)) {
+            if (!(found === null || found === void 0 ? void 0 : found.sha) || isGitSubmodule(found)) {
                 throw new FileNotFoundError(path);
             }
             treeSha = found.sha;
@@ -4238,8 +4238,20 @@ class BranchFileCache {
             return cached;
         }
         // try the fetch the entire tree first
-        const fetched = await this.fetchTree(sha, true);
-        if (fetched.truncated) {
+        let fetched;
+        try {
+            fetched = await this.fetchTree(sha, true);
+        }
+        catch (e) {
+            if (e instanceof request_error_1.RequestError && e.status === 422) {
+                // HTTP 422 occurs when submodules are present in the repo
+                // Fall back to non-recursive tree fetching
+            }
+            else {
+                throw e;
+            }
+        }
+        if (!fetched || fetched.truncated) {
             // we are unable to fetch the entire tree, so fetch only contents of
             // this single directory
             const singleDirectory = await this.fetchTree(sha, false);
@@ -4322,6 +4334,10 @@ class BranchFileCache {
                     !path.startsWith(pathPrefix)) {
                     continue;
                 }
+                // Git Submodules (mode === '160000' or type === 'commit'): Explicitly ignore and skip
+                if (isGitSubmodule(treeEntry)) {
+                    continue;
+                }
                 // If the result for this SHA was incomplete, dig deeper on the subtrees
                 if (!cachedTree.recursive && treeEntry.type === 'tree') {
                     treeShas.push({ ref: treeEntry.sha, path });
@@ -4355,6 +4371,9 @@ class BranchFileCache {
     }
 }
 exports.BranchFileCache = BranchFileCache;
+function isGitSubmodule(treeEntry) {
+    return (treeEntry === null || treeEntry === void 0 ? void 0 : treeEntry.mode) === '160000' || (treeEntry === null || treeEntry === void 0 ? void 0 : treeEntry.type) === 'commit';
+}
 function stripPrefix(files, prefix) {
     if (!prefix) {
         return files;
@@ -17130,1623 +17149,6 @@ module.exports = {
 	stringEncaseCRLFWithFirstIndex
 };
 
-
-/***/ }),
-
-/***/ 11669:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.resolvePath = resolvePath;
-exports.findRepoRoot = findRepoRoot;
-exports.getGitFileData = getGitFileData;
-exports.getAllDiffs = getAllDiffs;
-exports.parseChanges = parseChanges;
-exports.getChanges = getChanges;
-exports.getDiffString = getDiffString;
-const child_process_1 = __nccwpck_require__(35317);
-const types_1 = __nccwpck_require__(45294);
-const logger_1 = __nccwpck_require__(35919);
-const fs_1 = __nccwpck_require__(79896);
-const path = __nccwpck_require__(16928);
-class InstallationError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = 'InstallationError';
-    }
-}
-/**
- * Get the absolute path of a relative path
- * @param {string} dir the wildcard directory containing git change, not necessarily the root git directory
- * @returns {string} the absolute path relative to the path that the user executed the bash command in
- */
-function resolvePath(dir) {
-    const absoluteDir = path.resolve(process.cwd(), dir);
-    return absoluteDir;
-}
-/**
- * Get the git root directory.
- * Errors if the directory provided is not a git directory.
- * @param {string} dir an absolute directory
- * @returns {string} the absolute path of the git directory root
- */
-function findRepoRoot(dir) {
-    try {
-        return (0, child_process_1.execSync)('git rev-parse --show-toplevel', { cwd: dir })
-            .toString()
-            .trimRight(); // remove the trailing \n
-    }
-    catch (err) {
-        logger_1.logger.error(`The directory provided is not a git directory: ${dir}`);
-        throw err;
-    }
-}
-/**
- * Returns the git diff old/new mode, status, and path. Given a git diff.
- * Errors if there is a parsing error
- * @param {string} gitDiffPattern A single file diff. Renames and copies are broken up into separate diffs. See https://git-scm.com/docs/git-diff#Documentation/git-diff.txt-git-diff-filesltpatterngt82308203 for more details
- * @returns indexable git diff fields: old/new mode, status, and path
- */
-function parseGitDiff(gitDiffPattern) {
-    try {
-        const fields = gitDiffPattern.split(' ');
-        const newMode = fields[1];
-        const oldMode = fields[0].substring(1);
-        const statusAndPath = fields[4].split('\t');
-        const status = statusAndPath[0];
-        const relativePath = statusAndPath[1];
-        return { oldMode, newMode, status, relativePath };
-    }
-    catch (err) {
-        logger_1.logger.warn(`\`git diff --raw\` may have changed formats: \n ${gitDiffPattern}`);
-        throw err;
-    }
-}
-/**
- * Get the GitHub mode, file content, and relative path asynchronously
- * Rejects if there is a git diff error, or if the file contents could not be loaded.
- * @param {string} gitRootDir the root of the local GitHub repository
- * @param {string} gitDiffPattern A single file diff. Renames and copies are broken up into separate diffs. See https://git-scm.com/docs/git-diff#Documentation/git-diff.txt-git-diff-filesltpatterngt82308203 for more details
- * @returns {Promise<GitFileData>} the current mode, the relative path of the file in the Git Repository, and the file status.
- */
-function getGitFileData(gitRootDir, gitDiffPattern) {
-    return new Promise((resolve, reject) => {
-        try {
-            const { oldMode, newMode, status, relativePath } = parseGitDiff(gitDiffPattern);
-            // if file is deleted, do not attempt to read it
-            if (status === 'D') {
-                resolve({ path: relativePath, fileData: new types_1.FileData(null, oldMode) });
-            }
-            else {
-                // else read the file
-                (0, fs_1.readFile)(gitRootDir + '/' + relativePath, {
-                    encoding: 'utf-8',
-                }, (err, content) => {
-                    if (err) {
-                        logger_1.logger.error(`Error loading file ${relativePath} in git directory ${gitRootDir}`);
-                        reject(err);
-                    }
-                    resolve({
-                        path: relativePath,
-                        fileData: new types_1.FileData(content, newMode),
-                    });
-                });
-            }
-        }
-        catch (err) {
-            reject(err);
-        }
-    });
-}
-/**
- * Get all the diffs using `git diff` of a git directory.
- * Errors if the git directory provided is not a git directory.
- * @param {string} gitRootDir a git directory
- * @returns {string[]} a list of git diffs
- */
-function getAllDiffs(gitRootDir) {
-    (0, child_process_1.execSync)('git add -A', { cwd: gitRootDir });
-    const diffs = (0, child_process_1.execSync)('git diff --raw --staged --no-renames', {
-        cwd: gitRootDir,
-    })
-        .toString() // strictly return buffer for mocking purposes. sinon ts doesn't infer {encoding: 'utf-8'}
-        .trimRight() // remove the trailing new line
-        .split('\n')
-        .filter(line => !!line.trim());
-    (0, child_process_1.execSync)('git reset .', { cwd: gitRootDir });
-    return diffs;
-}
-/**
- * Get the git changes of the current project asynchronously.
- * Rejects if any of the files fails to load (if not deleted),
- * or if there is a git diff parse error
- * @param {string[]} diffs the git diff raw output (which only shows relative paths)
- * @param {string} gitDir the root of the local GitHub repository
- * @returns {Promise<Changes>} the changeset
- */
-async function parseChanges(diffs, gitDir) {
-    try {
-        // get updated file contents
-        const changes = new Map();
-        const changePromises = [];
-        for (let i = 0; i < diffs.length; i++) {
-            // TODO - handle memory constraint
-            changePromises.push(getGitFileData(gitDir, diffs[i]));
-        }
-        const gitFileDatas = await Promise.all(changePromises);
-        for (let i = 0; i < gitFileDatas.length; i++) {
-            changes.set(gitFileDatas[i].path, gitFileDatas[i].fileData);
-        }
-        return changes;
-    }
-    catch (err) {
-        logger_1.logger.error('Error parsing git changes');
-        throw err;
-    }
-}
-/**
- * Throws an error if git is not installed
- * @returns {void} void if git is installed
- */
-function validateGitInstalled() {
-    try {
-        (0, child_process_1.execSync)('git --version');
-    }
-    catch (err) {
-        logger_1.logger.error('git not installed');
-        throw new InstallationError('git command is not recognized. Make sure git is installed.');
-    }
-}
-/**
- * Load the change set asynchronously.
- * @param dir the directory containing git changes
- * @returns {Promise<Changes>} the change set
- */
-function getChanges(dir) {
-    try {
-        validateGitInstalled();
-        const absoluteDir = resolvePath(dir);
-        const gitRootDir = findRepoRoot(absoluteDir);
-        const diffs = getAllDiffs(gitRootDir);
-        return parseChanges(diffs, gitRootDir);
-    }
-    catch (err) {
-        if (!(err instanceof InstallationError)) {
-            logger_1.logger.error('Error loadng git changes.');
-        }
-        throw err;
-    }
-}
-/**
- * Get the git changes of the current project asynchronously.
- * Rejects if any of the files fails to load (if not deleted),
- * or if there is a git diff parse error
- * @param {string[]} diffs the git diff raw output (which only shows relative paths)
- * @param {string} gitDir the root of the local GitHub repository
- * @returns {string} the diff
- */
-function getDiffString(dir) {
-    try {
-        validateGitInstalled();
-        const absoluteDir = resolvePath(dir);
-        const gitRootDir = findRepoRoot(absoluteDir);
-        (0, child_process_1.execSync)('git add -A', { cwd: gitRootDir });
-        const diff = (0, child_process_1.execSync)('git diff --staged --no-renames', {
-            cwd: gitRootDir,
-        })
-            .toString() // strictly return buffer for mocking purposes. sinon ts doesn't infer {encoding: 'utf-8'}
-            .trimRight(); // remove the trailing new line
-        (0, child_process_1.execSync)('git reset .', { cwd: gitRootDir });
-        return diff;
-    }
-    catch (err) {
-        if (!(err instanceof InstallationError)) {
-            logger_1.logger.error('Error loadng git changes.');
-        }
-        throw err;
-    }
-}
-//# sourceMappingURL=handle-git-dir-change.js.map
-
-/***/ }),
-
-/***/ 27008:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.addPullRequestDefaults = addPullRequestDefaults;
-exports.addReviewCommentsDefaults = addReviewCommentsDefaults;
-const DEFAULT_BRANCH_NAME = 'code-suggestions';
-const DEFAULT_PRIMARY_BRANCH = 'main';
-const DEFAULT_PAGE_SIZE = 100;
-/**
- * Add defaults to GitHub Pull Request options.
- * Preserves the empty string.
- * For ESCMAScript, null/undefined values are preserved for required fields.
- * Recommended with an object validation function to check empty strings and incorrect types.
- * @param {PullRequestUserOptions} options the user-provided github pull request options
- * @returns {CreatePullRequest} git hub context with defaults applied
- */
-function addPullRequestDefaults(options) {
-    const pullRequestSettings = {
-        upstreamOwner: options.upstreamOwner,
-        upstreamRepo: options.upstreamRepo,
-        description: options.description,
-        title: options.title,
-        message: options.message,
-        force: options.force || false,
-        branch: typeof options.branch === 'string' ? options.branch : DEFAULT_BRANCH_NAME,
-        primary: typeof options.primary === 'string'
-            ? options.primary
-            : DEFAULT_PRIMARY_BRANCH,
-        maintainersCanModify: options.maintainersCanModify === false ? false : true,
-        filesPerCommit: options.filesPerCommit,
-    };
-    return pullRequestSettings;
-}
-/**
- * Format user input for pull request review comments
- * @param options The user's options input for review comments
- * @returns the formatted version of user input for pull request review comments
- */
-function addReviewCommentsDefaults(options) {
-    const createReviewComment = {
-        repo: options.repo,
-        owner: options.owner,
-        pullNumber: options.pullNumber,
-        // if zero set as 0
-        pageSize: options.pageSize === null || options.pageSize === undefined
-            ? DEFAULT_PAGE_SIZE
-            : options.pageSize,
-    };
-    return createReviewComment;
-}
-//# sourceMappingURL=default-options-handler.js.map
-
-/***/ }),
-
-/***/ 59312:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-// Copyright 2023 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.CommitError = void 0;
-class CommitError extends Error {
-    constructor(message, cause) {
-        super(message);
-        this.cause = cause;
-    }
-}
-exports.CommitError = CommitError;
-//# sourceMappingURL=errors.js.map
-
-/***/ }),
-
-/***/ 42819:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createRef = createRef;
-exports.getBranchHead = getBranchHead;
-exports.existsBranchWithName = existsBranchWithName;
-exports.createBranch = createBranch;
-exports.branch = branch;
-const logger_1 = __nccwpck_require__(35919);
-const REF_PREFIX = 'refs/heads/';
-const DEFAULT_PRIMARY_BRANCH = 'main';
-/**
- * Create a new branch reference with the ref prefix
- * @param {string} branchName name of the branch
- */
-function createRef(branchName) {
-    return REF_PREFIX + branchName;
-}
-/**
- * get branch commit HEAD SHA of a repository
- * Throws an error if the branch cannot be found
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} origin The domain information of the remote origin repository
- * @param {string} branch the name of the branch
- * @returns {Promise<string>} branch commit HEAD SHA
- */
-async function getBranchHead(octokit, origin, branch) {
-    const branchData = (await octokit.repos.getBranch({
-        owner: origin.owner,
-        repo: origin.repo,
-        branch,
-    })).data;
-    logger_1.logger.info(`Successfully found branch HEAD sha "${branchData.commit.sha}".`);
-    return branchData.commit.sha;
-}
-/**
- * Determine if there is a branch with the provided name in the remote GitHub repository
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} remote The domain information of the remote repository
- * @param {string} name The branch name to create on the repository
- * @returns {Promise<boolean>} if there is a branch already existing in the remote GitHub repository
- */
-async function existsBranchWithName(octokit, remote, name) {
-    try {
-        const data = (await octokit.git.getRef({
-            owner: remote.owner,
-            repo: remote.repo,
-            ref: `heads/${name}`,
-        })).data;
-        return data.ref ? true : false;
-    }
-    catch (err) {
-        if (err.status === 404)
-            return false;
-        else
-            throw err;
-    }
-}
-/**
- * Create a branch on the remote repository if there is not an existing branch
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} remote The domain information of the remote origin repository
- * @param {string} name The branch name to create on the origin repository
- * @param {string} baseSha the sha that the base of the reference points to
- * @param {boolean} duplicate whether there is an existing branch or not
- * @returns {Promise<void>}
- */
-async function createBranch(octokit, remote, name, baseSha, duplicate) {
-    if (!duplicate) {
-        const refData = (await octokit.git.createRef({
-            owner: remote.owner,
-            repo: remote.repo,
-            ref: createRef(name),
-            sha: baseSha,
-        })).data;
-        logger_1.logger.info(`Successfully created branch at ${refData.url}`);
-    }
-    else {
-        logger_1.logger.info('Skipping branch creation step...');
-    }
-}
-/**
- * Create a GitHub branch given a remote origin.
- * Throws an exception if octokit fails, or if the base branch is invalid
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} origin The domain information of the remote origin repository
- * @param {RepoDomain} upstream The domain information of the remote upstream repository
- * @param {string} name The branch name to create on the origin repository
- * @param {string} baseBranch the name of the branch to base the new branch off of. Default is main
- * @returns {Promise<string>} the base SHA for subsequent commits to be based off for the origin branch
- */
-async function branch(octokit, origin, upstream, name, baseBranch = DEFAULT_PRIMARY_BRANCH) {
-    // create branch from primary branch HEAD SHA
-    try {
-        const baseSha = await getBranchHead(octokit, upstream, baseBranch);
-        const duplicate = await existsBranchWithName(octokit, origin, name);
-        await createBranch(octokit, origin, name, baseSha, duplicate);
-        return baseSha;
-    }
-    catch (err) {
-        logger_1.logger.error('Error when creating branch');
-        throw err;
-    }
-}
-//# sourceMappingURL=branch.js.map
-
-/***/ }),
-
-/***/ 75451:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.generateTreeObjects = generateTreeObjects;
-exports.createTree = createTree;
-exports.updateRef = updateRef;
-exports.commitAndPush = commitAndPush;
-const logger_1 = __nccwpck_require__(35919);
-const create_commit_1 = __nccwpck_require__(13641);
-const errors_1 = __nccwpck_require__(59312);
-const DEFAULT_FILES_PER_COMMIT = 100;
-/**
- * Generate and return a GitHub tree object structure
- * containing the target change data
- * See https://developer.github.com/v3/git/trees/#tree-object
- * @param {Changes} changes the set of repository changes
- * @returns {TreeObject[]} The new GitHub changes
- */
-function generateTreeObjects(changes) {
-    const tree = [];
-    changes.forEach((fileData, path) => {
-        if (fileData.content === null) {
-            // if no file content then file is deleted
-            tree.push({
-                path,
-                mode: fileData.mode,
-                type: 'blob',
-                sha: null,
-            });
-        }
-        else {
-            // update file with its content
-            tree.push({
-                path,
-                mode: fileData.mode,
-                type: 'blob',
-                content: fileData.content,
-            });
-        }
-    });
-    return tree;
-}
-function* inGroupsOf(all, groupSize) {
-    for (let i = 0; i < all.length; i += groupSize) {
-        yield all.slice(i, i + groupSize);
-    }
-}
-/**
- * Upload and create a remote GitHub tree
- * and resolves with the new tree SHA.
- * Rejects if GitHub V3 API fails with the GitHub error response
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} origin the the remote repository to push changes to
- * @param {string} refHead the base of the new commit(s)
- * @param {TreeObject[]} tree the set of GitHub changes to upload
- * @returns {Promise<string>} the GitHub tree SHA
- * @throws {CommitError}
- */
-async function createTree(octokit, origin, refHead, tree) {
-    const oldTreeSha = (await octokit.git.getCommit({
-        owner: origin.owner,
-        repo: origin.repo,
-        commit_sha: refHead,
-    })).data.tree.sha;
-    logger_1.logger.info('Got the latest commit tree');
-    try {
-        const treeSha = (await octokit.git.createTree({
-            owner: origin.owner,
-            repo: origin.repo,
-            tree,
-            base_tree: oldTreeSha,
-        })).data.sha;
-        logger_1.logger.info(`Successfully created a tree with the desired changes with SHA ${treeSha}`);
-        return treeSha;
-    }
-    catch (e) {
-        throw new errors_1.CommitError(`Error adding to tree: ${refHead}`, e);
-    }
-}
-/**
- * Update a reference to a SHA
- * Rejects if GitHub V3 API fails with the GitHub error response
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {BranchDomain} origin the the remote branch to push changes to
- * @param {string} newSha the ref to update the commit HEAD to
- * @param {boolean} force to force the commit changes given refHead
- * @returns {Promise<void>}
- */
-async function updateRef(octokit, origin, newSha, force) {
-    logger_1.logger.info(`Updating reference heads/${origin.branch} to ${newSha}`);
-    try {
-        await octokit.git.updateRef({
-            owner: origin.owner,
-            repo: origin.repo,
-            ref: `heads/${origin.branch}`,
-            sha: newSha,
-            force,
-        });
-        logger_1.logger.info(`Successfully updated reference ${origin.branch} to ${newSha}`);
-    }
-    catch (e) {
-        throw new errors_1.CommitError(`Error updating ref heads/${origin.branch} to ${newSha}`, e);
-    }
-}
-/**
- * Given a set of changes, apply the commit(s) on top of the given branch's head and upload it to GitHub
- * Rejects if GitHub V3 API fails with the GitHub error response
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {string} refHead the base of the new commit(s)
- * @param {Changes} changes the set of repository changes
- * @param {RepoDomain} origin the the remote repository to push changes to
- * @param {string} originBranchName the remote branch that will contain the new changes
- * @param {string} commitMessage the message of the new commit
- * @param {boolean} force to force the commit changes given refHead
- * @returns {Promise<void>}
- * @throws {CommitError}
- */
-async function commitAndPush(octokit, refHead, changes, originBranch, commitMessage, force, options) {
-    var _a;
-    const filesPerCommit = (_a = options === null || options === void 0 ? void 0 : options.filesPerCommit) !== null && _a !== void 0 ? _a : DEFAULT_FILES_PER_COMMIT;
-    const tree = generateTreeObjects(changes);
-    for (const treeGroup of inGroupsOf(tree, filesPerCommit)) {
-        const treeSha = await createTree(octokit, originBranch, refHead, treeGroup);
-        refHead = await (0, create_commit_1.createCommit)(octokit, originBranch, refHead, treeSha, commitMessage, options);
-    }
-    await updateRef(octokit, originBranch, refHead, force);
-}
-//# sourceMappingURL=commit-and-push.js.map
-
-/***/ }),
-
-/***/ 13641:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2022 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createCommit = createCommit;
-const logger_1 = __nccwpck_require__(35919);
-const errors_1 = __nccwpck_require__(59312);
-/**
- * Create a commit with a repo snapshot SHA on top of the reference HEAD
- * and resolves with the SHA of the commit.
- * Rejects if GitHub V3 API fails with the GitHub error response
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} origin the the remote repository to push changes to
- * @param {string} refHead the base of the new commit(s)
- * @param {string} treeSha the tree SHA that this commit will point to
- * @param {string} message the message of the new commit
- * @returns {Promise<string>} the new commit SHA
- * @see https://docs.github.com/en/rest/git/commits?apiVersion=2022-11-28#create-a-commit
- */
-async function createCommit(octokit, origin, refHead, treeSha, message, options = {}) {
-    try {
-        const signature = options.signer
-            ? await options.signer.generateSignature({
-                message,
-                tree: treeSha,
-                parents: [refHead],
-                author: options.author,
-                committer: options.committer,
-            })
-            : undefined;
-        const { data: { sha, url }, } = await octokit.git.createCommit({
-            owner: origin.owner,
-            repo: origin.repo,
-            message,
-            tree: treeSha,
-            parents: [refHead],
-            signature,
-            author: options.author,
-            committer: options.committer,
-        });
-        logger_1.logger.info(`Successfully created commit. See commit at ${url}`);
-        return sha;
-    }
-    catch (e) {
-        throw new errors_1.CommitError(`Error creating commit for: ${treeSha}`, e);
-    }
-}
-//# sourceMappingURL=create-commit.js.map
-
-/***/ }),
-
-/***/ 33239:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.fork = fork;
-const logger_1 = __nccwpck_require__(35919);
-/**
- * Fork the GitHub owner's repository.
- * Returns the fork owner and fork repo when the fork creation request to GitHub succeeds.
- * Otherwise throws error.
- *
- * If fork already exists no new fork is created, no error occurs, and the existing Fork data is returned
- * with the `updated_at` + any historical repo changes.
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} upstream upstream repository information
- * @returns {Promise<RepoDomain>} the forked repository name, as well as the owner of that fork
- */
-async function fork(octokit, upstream) {
-    try {
-        const forkedRepo = (await octokit.repos.createFork({
-            owner: upstream.owner,
-            repo: upstream.repo,
-        })).data;
-        const origin = {
-            repo: forkedRepo.name,
-            owner: forkedRepo.owner.login,
-        };
-        logger_1.logger.info(`Create fork request was successful for ${origin.owner}/${origin.repo}`);
-        return origin;
-    }
-    catch (err) {
-        logger_1.logger.error('Error when forking');
-        throw err;
-    }
-}
-//# sourceMappingURL=fork.js.map
-
-/***/ }),
-
-/***/ 33784:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2021 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.addLabels = addLabels;
-const logger_1 = __nccwpck_require__(35919);
-/**
- * Create a GitHub PR on the upstream organization's repo
- * Throws an error if the GitHub API fails
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} upstream The upstream repository
- * @param {BranchDomain} origin The remote origin information that contains the origin branch
- * @param {number} issue_number The issue number to add labels to. Can also be a PR number
- * @param {string[]} labels The list of labels to apply to the issue/pull request. Default is []. the funciton will no-op.
- * @returns {Promise<string[]>} The list of resulting labels after the addition of the given labels
- */
-async function addLabels(octokit, upstream, origin, issue_number, labels) {
-    if (!labels || labels.length === 0) {
-        return [];
-    }
-    const labelsResponseData = (await octokit.issues.addLabels({
-        owner: upstream.owner,
-        repo: origin.repo,
-        issue_number: issue_number,
-        labels: labels,
-    })).data;
-    logger_1.logger.info(`Successfully added labels ${labels} to issue: ${issue_number}`);
-    return labelsResponseData.map(l => l.name);
-}
-//# sourceMappingURL=labels.js.map
-
-/***/ }),
-
-/***/ 40667:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.openPullRequest = openPullRequest;
-const logger_1 = __nccwpck_require__(35919);
-const DEFAULT_PRIMARY = 'main';
-/**
- * Create a GitHub PR on the upstream organization's repo
- * Throws an error if the GitHub API fails
- * @param {Octokit} octokit The authenticated octokit instance
- * @param {RepoDomain} upstream The upstream repository
- * @param {BranchDomain} origin The remote origin information that contains the origin branch
- * @param {Description} description The pull request title and detailed description
- * @param {boolean} maintainersCanModify Whether or not maintainers can modify the pull request. Default is true
- * @param {string} upstreamPrimary The upstream repository's primary branch. Default is main.
- * @param draft Open a DRAFT pull request.  Defaults to false.
- * @returns {Promise<void>}
- */
-async function openPullRequest(octokit, upstream, origin, description, maintainersCanModify = true, upstreamPrimary = DEFAULT_PRIMARY, draft = false) {
-    const head = `${origin.owner}:${origin.branch}`;
-    const existingPullRequest = (await octokit.pulls.list({
-        owner: upstream.owner,
-        repo: origin.repo,
-        head,
-    })).data.find(pr => pr.head.label === head);
-    if (existingPullRequest) {
-        logger_1.logger.info(`Found existing pull request for reference ${origin.owner}:${origin.branch}. Skipping creating a new pull request.`);
-        return existingPullRequest.number;
-    }
-    const pullResponseData = (await octokit.pulls.create({
-        owner: upstream.owner,
-        repo: origin.repo,
-        title: description.title,
-        head: `${origin.owner}:${origin.branch}`,
-        base: upstreamPrimary,
-        body: description.body,
-        maintainer_can_modify: maintainersCanModify,
-        draft: draft,
-    })).data;
-    logger_1.logger.info(`Successfully opened pull request available at url: ${pullResponseData.url}.`);
-    return pullResponseData.number;
-}
-//# sourceMappingURL=open-pull-request.js.map
-
-/***/ }),
-
-/***/ 46015:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.buildSummaryComment = buildSummaryComment;
-exports.buildReviewComments = buildReviewComments;
-exports.makeInlineSuggestions = makeInlineSuggestions;
-exports.createPullRequestReview = createPullRequestReview;
-exports.getCurrentPullRequestPatches = getCurrentPullRequestPatches;
-exports.getPullRequestHunks = getPullRequestHunks;
-const logger_1 = __nccwpck_require__(35919);
-const diff_utils_1 = __nccwpck_require__(97210);
-const hunk_utils_1 = __nccwpck_require__(43809);
-function hunkErrorMessage(hunk) {
-    return `  * lines ${hunk.oldStart}-${hunk.oldEnd}`;
-}
-function fileErrorMessage(filename, hunks) {
-    return `* ${filename}\n` + hunks.map(hunkErrorMessage).join('\n');
-}
-/**
- * Build an error message based on invalid hunks.
- * Returns an empty string if the provided hunks are empty.
- * @param invalidHunks a map of filename to hunks that are not suggestable
- */
-function buildSummaryComment(invalidHunks) {
-    if (invalidHunks.size === 0) {
-        return '';
-    }
-    return ('Some suggestions could not be made:\n' +
-        Array.from(invalidHunks, ([filename, hunks]) => fileErrorMessage(filename, hunks)).join('\n'));
-}
-const COMFORT_PREVIEW_HEADER = 'application/vnd.github.comfort-fade-preview+json';
-/**
- * Convert the patch suggestions into GitHub parameter objects.
- * Use this to generate review comments
- * For information see:
- * https://developer.github.com/v3/pulls/comments/#create-a-review-comment-for-a-pull-request
- * @param suggestions
- */
-function buildReviewComments(suggestions) {
-    const fileComments = [];
-    suggestions.forEach((hunks, fileName) => {
-        hunks.forEach(hunk => {
-            const newContent = hunk.newContent.join('\n');
-            if (hunk.oldStart === hunk.oldEnd) {
-                const singleComment = {
-                    path: fileName,
-                    body: `\`\`\`suggestion\n${newContent}\n\`\`\``,
-                    line: hunk.oldEnd,
-                    side: 'RIGHT',
-                };
-                fileComments.push(singleComment);
-            }
-            else {
-                const comment = {
-                    path: fileName,
-                    body: `\`\`\`suggestion\n${newContent}\n\`\`\``,
-                    start_line: hunk.oldStart,
-                    line: hunk.oldEnd,
-                    side: 'RIGHT',
-                    start_side: 'RIGHT',
-                };
-                fileComments.push(comment);
-            }
-        });
-    });
-    return fileComments;
-}
-/**
- * Make a request to GitHub to make review comments
- * @param octokit an authenticated octokit instance
- * @param suggestions code suggestions patches
- * @param remote the repository domain
- * @param pullNumber the pull request number to make a review on
- */
-async function makeInlineSuggestions(octokit, suggestions, outOfScopeSuggestions, remote, pullNumber) {
-    const comments = buildReviewComments(suggestions);
-    if (!comments.length) {
-        logger_1.logger.info('No valid suggestions to make');
-    }
-    if (!comments.length && !outOfScopeSuggestions.size) {
-        logger_1.logger.info('No suggestions were generated. Exiting...');
-        return null;
-    }
-    const summaryComment = buildSummaryComment(outOfScopeSuggestions);
-    if (summaryComment) {
-        logger_1.logger.warn('Some suggestions could not be made');
-    }
-    // apply the suggestions to the latest sha
-    // the latest Pull Request hunk range includes
-    // all previous commit valid hunk ranges
-    const headSha = (await octokit.pulls.get({
-        owner: remote.owner,
-        repo: remote.repo,
-        pull_number: pullNumber,
-    })).data.head.sha;
-    const reviewNumber = (await octokit.pulls.createReview({
-        owner: remote.owner,
-        repo: remote.repo,
-        pull_number: pullNumber,
-        commit_id: headSha,
-        event: 'COMMENT',
-        body: summaryComment,
-        headers: { accept: COMFORT_PREVIEW_HEADER },
-        // Octokit type definitions doesn't support mulitiline comments, but the GitHub API does
-        comments: comments,
-    })).data.id;
-    logger_1.logger.info(`Successfully created a review on pull request: ${pullNumber}.`);
-    return reviewNumber;
-}
-/**
- * Comment on a Pull Request
- * @param {Octokit} octokit authenticated octokit isntance
- * @param {RepoDomain} remote the Pull Request repository
- * @param {number} pullNumber the Pull Request number
- * @param {number} pageSize the number of files to comment on // TODO pagination
- * @param {Map<string, FileDiffContent>} diffContents the old and new contents of the files to suggest
- * @returns the created review's id, or null if no review was made
- */
-async function createPullRequestReview(octokit, remote, pullNumber, pageSize, diffContents) {
-    try {
-        // get the hunks from the pull request
-        const pullRequestHunks = await exports.getPullRequestHunks(octokit, remote, pullNumber, pageSize);
-        // get the hunks from the suggested change
-        const allSuggestedHunks = typeof diffContents === 'string'
-            ? (0, diff_utils_1.parseAllHunks)(diffContents)
-            : (0, hunk_utils_1.getRawSuggestionHunks)(diffContents);
-        // split hunks by commentable and uncommentable
-        const { validHunks, invalidHunks } = (0, hunk_utils_1.partitionSuggestedHunksByScope)(pullRequestHunks, allSuggestedHunks);
-        // create pull request review
-        const reviewNumber = await exports.makeInlineSuggestions(octokit, validHunks, invalidHunks, remote, pullNumber);
-        return reviewNumber;
-    }
-    catch (err) {
-        logger_1.logger.error('Failed to suggest');
-        throw err;
-    }
-}
-/**
- * For a pull request, get each remote file's patch text asynchronously
- * Also get the list of files whose patch data could not be returned
- * @param {Octokit} octokit the authenticated octokit instance
- * @param {RepoDomain} remote the remote repository domain information
- * @param {number} pullNumber the pull request number
- * @param {number} pageSize the number of results to return per page
- * @returns {Promise<Object<PatchText, string[]>>} the stringified patch data for each file and the list of files whose patch data could not be resolved
- */
-async function getCurrentPullRequestPatches(octokit, remote, pullNumber, pageSize) {
-    // TODO: support pagination
-    const filesMissingPatch = [];
-    const files = (await octokit.pulls.listFiles({
-        owner: remote.owner,
-        repo: remote.repo,
-        pull_number: pullNumber,
-        per_page: pageSize,
-    })).data;
-    const patches = new Map();
-    if (files.length === 0) {
-        logger_1.logger.error(`0 file results have returned from list files query for Pull Request #${pullNumber}. Cannot make suggestions on an empty Pull Request`);
-        throw Error('Empty Pull Request');
-    }
-    files.forEach(file => {
-        if (file.patch === undefined) {
-            // files whose patch is too large do not return the patch text by default
-            // TODO handle file patches that are too large
-            logger_1.logger.warn(`File ${file.filename} may have a patch that is too large to display patch object.`);
-            filesMissingPatch.push(file.filename);
-        }
-        else {
-            patches.set(file.filename, file.patch);
-        }
-    });
-    if (patches.size === 0) {
-        logger_1.logger.warn('0 patches have been returned. This could be because the patch results were too large to return.');
-    }
-    return { patches, filesMissingPatch };
-}
-/**
- * For a pull request, get each remote file's current patch range to identify the scope of each patch as a Map.
- * @param {Octokit} octokit the authenticated octokit instance
- * @param {RepoDomain} remote the remote repository domain information
- * @param {number} pullNumber the pull request number
- * @param {number} pageSize the number of files to return per pull request list files query
- * @returns {Promise<Map<string, Hunk[]>>} the scope of each file in the pull request
- */
-async function getPullRequestHunks(octokit, remote, pullNumber, pageSize) {
-    const files = (await octokit.pulls.listFiles({
-        owner: remote.owner,
-        repo: remote.repo,
-        pull_number: pullNumber,
-        per_page: pageSize,
-    })).data;
-    const pullRequestHunks = new Map();
-    if (files.length === 0) {
-        logger_1.logger.error(`0 file results have returned from list files query for Pull Request #${pullNumber}. Cannot make suggestions on an empty Pull Request`);
-        throw Error('Empty Pull Request');
-    }
-    files.forEach(file => {
-        if (file.patch === undefined) {
-            // files whose patch is too large do not return the patch text by default
-            // TODO handle file patches that are too large
-            logger_1.logger.warn(`File ${file.filename} may have a patch that is too large to display patch object.`);
-        }
-        else {
-            const hunks = (0, diff_utils_1.parsePatch)(file.patch);
-            pullRequestHunks.set(file.filename, hunks);
-        }
-    });
-    if (pullRequestHunks.size === 0) {
-        logger_1.logger.warn('0 patches have been returned. This could be because the patch results were too large to return.');
-    }
-    return pullRequestHunks;
-}
-//# sourceMappingURL=review-pull-request.js.map
-
-/***/ }),
-
-/***/ 58903:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.CommitError = exports.getDiffString = exports.getChanges = void 0;
-exports.reviewPullRequest = reviewPullRequest;
-exports.createPullRequest = createPullRequest;
-exports.parseTextFiles = parseTextFiles;
-const types_1 = __nccwpck_require__(45294);
-const logger_1 = __nccwpck_require__(35919);
-const default_options_handler_1 = __nccwpck_require__(27008);
-const retry = __nccwpck_require__(45195);
-const review_pull_request_1 = __nccwpck_require__(46015);
-const branch_1 = __nccwpck_require__(42819);
-const fork_1 = __nccwpck_require__(33239);
-const commit_and_push_1 = __nccwpck_require__(75451);
-const open_pull_request_1 = __nccwpck_require__(40667);
-const labels_1 = __nccwpck_require__(33784);
-var handle_git_dir_change_1 = __nccwpck_require__(11669);
-Object.defineProperty(exports, "getChanges", ({ enumerable: true, get: function () { return handle_git_dir_change_1.getChanges; } }));
-Object.defineProperty(exports, "getDiffString", ({ enumerable: true, get: function () { return handle_git_dir_change_1.getDiffString; } }));
-var errors_1 = __nccwpck_require__(59312);
-Object.defineProperty(exports, "CommitError", ({ enumerable: true, get: function () { return errors_1.CommitError; } }));
-/**
- * Given a set of suggestions, make all the multiline inline review comments on a given pull request given
- * that they are in scope of the pull request. Outof scope suggestions are not made.
- *
- * In-scope suggestions are specifically: the suggestion for a file must correspond to a file in the remote pull request
- * and the diff hunk computed for a file's contents must produce a range that is a subset of the pull request's files hunks.
- *
- * If a file is too large to load in the review, it is skipped in the suggestion phase.
- *
- * If changes are empty then the workflow will not run.
- * Rethrows an HttpError if Octokit GitHub API returns an error. HttpError Octokit access_token and client_secret headers redact all sensitive information.
- * @param octokit The authenticated octokit instance, instantiated with an access token having permissiong to create a fork on the target repository.
- * @param diffContents A set of changes. The changes may be empty.
- * @param options The configuration for interacting with GitHub provided by the user.
- * @returns the created review's id number, or null if there are no changes to be made.
- */
-async function reviewPullRequest(octokit, diffContents, options) {
-    (0, logger_1.setupLogger)(options.logger);
-    // if null undefined, or the empty map then no changes have been provided.
-    // Do not execute GitHub workflow
-    if (diffContents === null ||
-        diffContents === undefined ||
-        (typeof diffContents !== 'string' && diffContents.size === 0)) {
-        logger_1.logger.info('Empty changes provided. No suggestions to be made. Cancelling workflow.');
-        return null;
-    }
-    const gitHubConfigs = (0, default_options_handler_1.addReviewCommentsDefaults)(options);
-    const remote = {
-        owner: gitHubConfigs.owner,
-        repo: gitHubConfigs.repo,
-    };
-    const reviewNumber = await (0, review_pull_request_1.createPullRequestReview)(octokit, remote, gitHubConfigs.pullNumber, gitHubConfigs.pageSize, diffContents);
-    return reviewNumber;
-}
-/**
- * Make a new GitHub Pull Request with a set of changes applied on top of primary branch HEAD.
- * The changes are committed into a new branch based on the upstream repository options using the authenticated Octokit account.
- * Then a Pull Request is made from that branch.
- *
- * Also throws error if git data from the fork is not ready in 5 minutes.
- *
- * From the docs
- * https://developer.github.com/v3/repos/forks/#create-a-fork
- * """
- * Forking a Repository happens asynchronously.
- * You may have to wait a short period of time before you can access the git objects.
- * If this takes longer than 5 minutes, be sure to contact GitHub Support or GitHub Premium Support.
- * """
- *
- * If changes are empty then the workflow will not run.
- * Rethrows an HttpError if Octokit GitHub API returns an error. HttpError Octokit access_token and client_secret headers redact all sensitive information.
- * @param {Octokit} octokit The authenticated octokit instance, instantiated with an access token having permissiong to create a fork on the target repository
- * @param {Changes | null | undefined} changes A set of changes. The changes may be empty
- * @param {CreatePullRequestUserOptions} options The configuration for interacting with GitHub provided by the user.
- * @returns {Promise<number>} the pull request number. Returns 0 if unsuccessful.
- * @throws {CommitError} on failure during commit process
- */
-async function createPullRequest(octokit, changes, options) {
-    (0, logger_1.setupLogger)(options.logger);
-    // if null undefined, or the empty map then no changes have been provided.
-    // Do not execute GitHub workflow
-    if (changes === null || changes === undefined || changes.size === 0) {
-        logger_1.logger.info('Empty change set provided. No changes need to be made. Cancelling workflow.');
-        return 0;
-    }
-    const gitHubConfigs = (0, default_options_handler_1.addPullRequestDefaults)(options);
-    logger_1.logger.info('Starting GitHub PR workflow...');
-    const upstream = {
-        owner: gitHubConfigs.upstreamOwner,
-        repo: gitHubConfigs.upstreamRepo,
-    };
-    const origin = options.fork === false ? upstream : await (0, fork_1.fork)(octokit, upstream);
-    if (options.fork) {
-        // try to sync the fork
-        await retry(async () => await octokit.repos.mergeUpstream({
-            owner: origin.owner,
-            repo: origin.repo,
-            branch: gitHubConfigs.primary,
-        }), {
-            retries: options.retry,
-            factor: 2.8411, // https://www.wolframalpha.com/input/?i=Sum%5B3000*x%5Ek%2C+%7Bk%2C+0%2C+4%7D%5D+%3D+5+*+60+*+1000
-            minTimeout: 3000,
-            randomize: false,
-            onRetry: (e, attempt) => {
-                e.message = `Error creating syncing upstream: ${e.message}`;
-                logger_1.logger.error(e);
-                logger_1.logger.info(`Retry attempt #${attempt}...`);
-            },
-        });
-    }
-    const originBranch = {
-        ...origin,
-        branch: gitHubConfigs.branch,
-    };
-    // The `retry` flag defaults to `5` to maintain compatibility
-    options.retry = options.retry === undefined ? 5 : options.retry;
-    const refHeadSha = await retry(async () => await (0, branch_1.branch)(octokit, origin, upstream, originBranch.branch, gitHubConfigs.primary), {
-        retries: options.retry,
-        factor: 2.8411, // https://www.wolframalpha.com/input/?i=Sum%5B3000*x%5Ek%2C+%7Bk%2C+0%2C+4%7D%5D+%3D+5+*+60+*+1000
-        minTimeout: 3000,
-        randomize: false,
-        onRetry: (e, attempt) => {
-            e.message = `Error creating Pull Request: ${e.message}`;
-            logger_1.logger.error(e);
-            logger_1.logger.info(`Retry attempt #${attempt}...`);
-        },
-    });
-    await (0, commit_and_push_1.commitAndPush)(octokit, refHeadSha, changes, originBranch, gitHubConfigs.message, gitHubConfigs.force, options);
-    const description = {
-        body: gitHubConfigs.description,
-        title: gitHubConfigs.title,
-    };
-    const prNumber = await (0, open_pull_request_1.openPullRequest)(octokit, upstream, originBranch, description, gitHubConfigs.maintainersCanModify, gitHubConfigs.primary, options.draft);
-    logger_1.logger.info(`Successfully opened pull request: ${prNumber}.`);
-    // addLabels will no-op if options.labels is undefined or empty.
-    await (0, labels_1.addLabels)(octokit, upstream, originBranch, prNumber, options.labels);
-    return prNumber;
-}
-/**
- * Convert a Map<string,string> or {[path: string]: string}, where the key is the relative file path in the repository,
- * and the value is the text content. The files will be converted to a Map also containing the file mode information '100644'
- * @param {Object<string, string | null> | Map<string, string | null>} textFiles a map/object where the key is the relative file path and the value is the text file content
- * @returns {Changes} Map of the file path to the string file content and the file mode '100644'
- */
-function parseTextFiles(textFiles) {
-    const changes = new Map();
-    if (textFiles instanceof Map) {
-        textFiles.forEach((content, path) => {
-            if (typeof path !== 'string' ||
-                (content !== null && typeof content !== 'string')) {
-                throw TypeError('The file changeset provided must have a string key and a string/null value');
-            }
-            changes.set(path, new types_1.FileData(content));
-        });
-    }
-    else {
-        for (const [path, content] of Object.entries(textFiles)) {
-            if (typeof path !== 'string' ||
-                (content !== null && typeof content !== 'string')) {
-                throw TypeError('The file changeset provided must have a string key and a string/null value');
-            }
-            changes.set(path, new types_1.FileData(content));
-        }
-    }
-    return changes;
-}
-//# sourceMappingURL=index.js.map
-
-/***/ }),
-
-/***/ 35919:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.logger = void 0;
-exports.setupLogger = setupLogger;
-class NullLogger {
-    constructor() {
-        this.error = () => { };
-        this.warn = () => { };
-        this.info = () => { };
-        this.debug = () => { };
-        this.trace = () => { };
-    }
-}
-let logger = new NullLogger();
-exports.logger = logger;
-function setupLogger(userLogger) {
-    if (userLogger) {
-        exports.logger = logger = userLogger;
-    }
-    else {
-        exports.logger = logger = new NullLogger();
-    }
-}
-//# sourceMappingURL=logger.js.map
-
-/***/ }),
-
-/***/ 45294:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.PatchSyntaxError = exports.FileData = void 0;
-/**
- * The content and the mode of a file.
- * Default file mode is a text file which has code '100644'.
- * If `content` is not null, then `content` must be the entire file content.
- * See https://developer.github.com/v3/git/trees/#tree-object for details on mode.
- */
-class FileData {
-    constructor(content, mode = '100644') {
-        this.mode = mode;
-        this.content = content;
-    }
-}
-exports.FileData = FileData;
-class PatchSyntaxError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = 'PatchSyntaxError';
-    }
-}
-exports.PatchSyntaxError = PatchSyntaxError;
-//# sourceMappingURL=types.js.map
-
-/***/ }),
-
-/***/ 97210:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.parsePatch = parsePatch;
-exports.parseAllHunks = parseAllHunks;
-exports.getSuggestedHunks = getSuggestedHunks;
-const parseDiff = __nccwpck_require__(82673);
-const diff_1 = __nccwpck_require__(69463);
-// This header is ignored for calculating patch ranges, but is neccessary
-// for parsing a diff
-const _DIFF_HEADER = `diff --git a/file.ext b/file.ext
-index cac8fbc..87f387c 100644
---- a/file.ext
-+++ b/file.ext
-`;
-/**
- * Given a patch expressed in GNU diff format, return the range of lines
- * from the original content that are changed.
- * @param diff Diff expressed in GNU diff format.
- * @returns Hunk[]
- */
-function parsePatch(patch) {
-    return parseAllHunks(_DIFF_HEADER + patch).get('file.ext') || [];
-}
-/**
- * Given a diff expressed in GNU diff format, return the range of lines
- * from the original content that are changed.
- * @param diff Diff expressed in GNU diff format.
- * @returns Map<string, Hunk[]>
- */
-function parseAllHunks(diff) {
-    const hunksByFile = new Map();
-    parseDiff(diff).forEach(file => {
-        const filename = file.to ? file.to : file.from;
-        const chunks = file.chunks.map(chunk => {
-            let oldStart = chunk.oldStart;
-            let newStart = chunk.newStart;
-            let normalLines = 0;
-            let changeSeen = false;
-            const newLines = [];
-            let previousLine = null;
-            let nextLine = null;
-            chunk.changes.forEach(change => {
-                // strip off leading '+', '-', or ' ' and trailing carriage return
-                const content = change.content.substring(1).replace(/[\n\r]+$/g, '');
-                if (change.type === 'normal') {
-                    normalLines++;
-                    if (changeSeen) {
-                        if (nextLine === null) {
-                            nextLine = content;
-                        }
-                    }
-                    else {
-                        previousLine = content;
-                    }
-                }
-                else {
-                    if (change.type === 'add') {
-                        // strip off leading '+' and trailing carriage return
-                        newLines.push(content);
-                    }
-                    if (!changeSeen) {
-                        oldStart += normalLines;
-                        newStart += normalLines;
-                        changeSeen = true;
-                    }
-                }
-            });
-            const newEnd = newStart + chunk.newLines - normalLines - 1;
-            const oldEnd = oldStart + chunk.oldLines - normalLines - 1;
-            let hunk = {
-                oldStart: oldStart,
-                oldEnd: oldEnd,
-                newStart: newStart,
-                newEnd: newEnd,
-                newContent: newLines,
-            };
-            if (previousLine) {
-                hunk = { ...hunk, previousLine: previousLine };
-            }
-            if (nextLine) {
-                hunk = { ...hunk, nextLine: nextLine };
-            }
-            return hunk;
-        });
-        hunksByFile.set(filename, chunks);
-    });
-    return hunksByFile;
-}
-/**
- * Given two texts, return the range of lines that are changed.
- * @param oldContent The original content.
- * @param newContent The new content.
- * @returns Hunk[]
- */
-function getSuggestedHunks(oldContent, newContent) {
-    const diff = (0, diff_1.createPatch)('unused', oldContent, newContent);
-    return parseAllHunks(diff).get('unused') || [];
-}
-//# sourceMappingURL=diff-utils.js.map
-
-/***/ }),
-
-/***/ 43809:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//    http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.adjustHunkUp = adjustHunkUp;
-exports.adjustHunkDown = adjustHunkDown;
-exports.getRawSuggestionHunks = getRawSuggestionHunks;
-exports.partitionSuggestedHunksByScope = partitionSuggestedHunksByScope;
-const diff_utils_1 = __nccwpck_require__(97210);
-const logger_1 = __nccwpck_require__(35919);
-/**
- * Shift a Hunk up one line so it starts one line earlier.
- * @param {Hunk} hunk
- * @returns {Hunk | null} the adjusted Hunk or null if there is no preceeding line.
- */
-function adjustHunkUp(hunk) {
-    if (!hunk.previousLine) {
-        return null;
-    }
-    return {
-        oldStart: hunk.oldStart - 1,
-        oldEnd: hunk.oldEnd,
-        newStart: hunk.newStart - 1,
-        newEnd: hunk.newEnd,
-        newContent: [hunk.previousLine, ...hunk.newContent],
-    };
-}
-/**
- * Shift a Hunk up one line so it ends one line later.
- * @param {Hunk} hunk
- * @returns {Hunk | null} the adjusted Hunk or null if there is no following line.
- */
-function adjustHunkDown(hunk) {
-    if (!hunk.nextLine) {
-        return null;
-    }
-    return {
-        oldStart: hunk.oldStart,
-        oldEnd: hunk.oldEnd + 1,
-        newStart: hunk.newStart,
-        newEnd: hunk.newEnd + 1,
-        newContent: hunk.newContent.concat(hunk.nextLine),
-    };
-}
-/**
- * Given a map where the key is the file name and the value is the
- * old content and new content of the file
- * compute the hunk for each file whose old and new contents differ.
- * Do not compute the hunk if the old content is the same as the new content.
- * The hunk list is sorted and each interval is disjoint.
- * @param {Map<string, FileDiffContent>} diffContents a map of the original file contents and the new file contents
- * @returns the hunks for each file whose old and new contents differ
- */
-function getRawSuggestionHunks(diffContents) {
-    const fileHunks = new Map();
-    diffContents.forEach((fileDiffContent, fileName) => {
-        // if identical don't calculate the hunk and continue in the loop
-        if (fileDiffContent.oldContent === fileDiffContent.newContent) {
-            return;
-        }
-        const hunks = (0, diff_utils_1.getSuggestedHunks)(fileDiffContent.oldContent, fileDiffContent.newContent);
-        fileHunks.set(fileName, hunks);
-    });
-    logger_1.logger.info('Parsed ranges of old and new patch');
-    return fileHunks;
-}
-function hunkOverlaps(validHunk, suggestedHunk) {
-    return (suggestedHunk.oldStart >= validHunk.newStart &&
-        suggestedHunk.oldEnd <= validHunk.newEnd);
-}
-function partitionFileHunks(pullRequestHunks, suggestedHunks) {
-    // check ranges: the entirety of the old range of the suggested
-    // hunk must fit inside the new range of the valid Hunks
-    let i = 0;
-    let candidateHunk = pullRequestHunks[i];
-    const validFileHunks = [];
-    const invalidFileHunks = [];
-    suggestedHunks.forEach(suggestedHunk => {
-        while (candidateHunk && suggestedHunk.oldStart > candidateHunk.newEnd) {
-            i++;
-            candidateHunk = pullRequestHunks[i];
-        }
-        if (!candidateHunk) {
-            invalidFileHunks.push(suggestedHunk);
-            return;
-        }
-        // if deletion only or addition only
-        if (suggestedHunk.newEnd < suggestedHunk.newStart ||
-            suggestedHunk.oldEnd < suggestedHunk.oldStart) {
-            // try using previous line
-            let adjustedHunk = adjustHunkUp(suggestedHunk);
-            if (adjustedHunk && hunkOverlaps(candidateHunk, adjustedHunk)) {
-                validFileHunks.push(adjustedHunk);
-                return;
-            }
-            // try using next line
-            adjustedHunk = adjustHunkDown(suggestedHunk);
-            if (adjustedHunk && hunkOverlaps(candidateHunk, adjustedHunk)) {
-                validFileHunks.push(adjustedHunk);
-                return;
-            }
-        }
-        else if (hunkOverlaps(candidateHunk, suggestedHunk)) {
-            validFileHunks.push(suggestedHunk);
-            return;
-        }
-        invalidFileHunks.push(suggestedHunk);
-    });
-    return { validFileHunks, invalidFileHunks };
-}
-/**
- * Split suggested hunks into commentable and non-commentable hunks. Compares the new line ranges
- * from pullRequestHunks against the old line ranges from allSuggestedHunks.
- * @param pullRequestHunks {Map<string, Hunk[]>} The parsed hunks from that represents the valid lines to comment.
- * @param allSuggestedHunks {Map<string, Hunk[]>} The hunks that represent suggested changes.
- * @returns {PartitionedHunks} split hunks
- */
-function partitionSuggestedHunksByScope(pullRequestHunks, allSuggestedHunks) {
-    const validHunks = new Map();
-    const invalidHunks = new Map();
-    allSuggestedHunks.forEach((suggestedHunks, filename) => {
-        const pullRequestFileHunks = pullRequestHunks.get(filename);
-        if (!pullRequestFileHunks) {
-            // file is not the original PR
-            invalidHunks.set(filename, suggestedHunks);
-            return;
-        }
-        const { validFileHunks, invalidFileHunks } = partitionFileHunks(pullRequestFileHunks, suggestedHunks);
-        if (validFileHunks.length > 0) {
-            validHunks.set(filename, validFileHunks);
-        }
-        if (invalidFileHunks.length > 0) {
-            invalidHunks.set(filename, invalidFileHunks);
-        }
-    });
-    return { validHunks, invalidHunks };
-}
-//# sourceMappingURL=hunk-utils.js.map
 
 /***/ }),
 
@@ -33815,51 +32217,48 @@ module.exports = value => {
 "use strict";
 
 
+const loader = __nccwpck_require__(91950)
+const dumper = __nccwpck_require__(59980)
 
-var loader = __nccwpck_require__(91950);
-var dumper = __nccwpck_require__(59980);
-
-
-function renamed(from, to) {
+function renamed (from, to) {
   return function () {
     throw new Error('Function yaml.' + from + ' is removed in js-yaml 4. ' +
-      'Use yaml.' + to + ' instead, which is now safe by default.');
-  };
+      'Use yaml.' + to + ' instead, which is now safe by default.')
+  }
 }
 
-
-module.exports.Type = __nccwpck_require__(9557);
-module.exports.Schema = __nccwpck_require__(62046);
-module.exports.FAILSAFE_SCHEMA = __nccwpck_require__(69832);
-module.exports.JSON_SCHEMA = __nccwpck_require__(58927);
-module.exports.CORE_SCHEMA = __nccwpck_require__(55746);
-module.exports.DEFAULT_SCHEMA = __nccwpck_require__(97336);
-module.exports.load                = loader.load;
-module.exports.loadAll             = loader.loadAll;
-module.exports.dump                = dumper.dump;
-module.exports.YAMLException = __nccwpck_require__(41248);
+module.exports.Type = __nccwpck_require__(9557)
+module.exports.Schema = __nccwpck_require__(62046)
+module.exports.FAILSAFE_SCHEMA = __nccwpck_require__(69832)
+module.exports.JSON_SCHEMA = __nccwpck_require__(58927)
+module.exports.CORE_SCHEMA = __nccwpck_require__(55746)
+module.exports.DEFAULT_SCHEMA = __nccwpck_require__(97336)
+module.exports.load = loader.load
+module.exports.loadAll = loader.loadAll
+module.exports.dump = dumper.dump
+module.exports.YAMLException = __nccwpck_require__(41248)
 
 // Re-export all types in case user wants to create custom schema
 module.exports.types = {
-  binary:    __nccwpck_require__(8149),
-  float:     __nccwpck_require__(57584),
-  map:       __nccwpck_require__(47316),
-  null:      __nccwpck_require__(4333),
-  pairs:     __nccwpck_require__(16267),
-  set:       __nccwpck_require__(78758),
+  binary: __nccwpck_require__(8149),
+  float: __nccwpck_require__(57584),
+  map: __nccwpck_require__(47316),
+  null: __nccwpck_require__(4333),
+  pairs: __nccwpck_require__(16267),
+  set: __nccwpck_require__(78758),
   timestamp: __nccwpck_require__(28966),
-  bool:      __nccwpck_require__(67296),
-  int:       __nccwpck_require__(84652),
-  merge:     __nccwpck_require__(76854),
-  omap:      __nccwpck_require__(58649),
-  seq:       __nccwpck_require__(77161),
-  str:       __nccwpck_require__(53929)
-};
+  bool: __nccwpck_require__(67296),
+  int: __nccwpck_require__(84652),
+  merge: __nccwpck_require__(76854),
+  omap: __nccwpck_require__(58649),
+  seq: __nccwpck_require__(77161),
+  str: __nccwpck_require__(53929)
+}
 
 // Removed functions from JS-YAML 3.0.x
-module.exports.safeLoad            = renamed('safeLoad', 'load');
-module.exports.safeLoadAll         = renamed('safeLoadAll', 'loadAll');
-module.exports.safeDump            = renamed('safeDump', 'dump');
+module.exports.safeLoad = renamed('safeLoad', 'load')
+module.exports.safeLoadAll = renamed('safeLoadAll', 'loadAll')
+module.exports.safeDump = renamed('safeDump', 'dump')
 
 
 /***/ }),
@@ -33870,63 +32269,54 @@ module.exports.safeDump            = renamed('safeDump', 'dump');
 "use strict";
 
 
-
-function isNothing(subject) {
-  return (typeof subject === 'undefined') || (subject === null);
+function isNothing (subject) {
+  return (typeof subject === 'undefined') || (subject === null)
 }
 
-
-function isObject(subject) {
-  return (typeof subject === 'object') && (subject !== null);
+function isObject (subject) {
+  return (typeof subject === 'object') && (subject !== null)
 }
 
+function toArray (sequence) {
+  if (Array.isArray(sequence)) return sequence
+  else if (isNothing(sequence)) return []
 
-function toArray(sequence) {
-  if (Array.isArray(sequence)) return sequence;
-  else if (isNothing(sequence)) return [];
-
-  return [ sequence ];
+  return [sequence]
 }
 
-
-function extend(target, source) {
-  var index, length, key, sourceKeys;
-
+function extend (target, source) {
   if (source) {
-    sourceKeys = Object.keys(source);
+    const sourceKeys = Object.keys(source)
 
-    for (index = 0, length = sourceKeys.length; index < length; index += 1) {
-      key = sourceKeys[index];
-      target[key] = source[key];
+    for (let index = 0, length = sourceKeys.length; index < length; index += 1) {
+      const key = sourceKeys[index]
+      target[key] = source[key]
     }
   }
 
-  return target;
+  return target
 }
 
+function repeat (string, count) {
+  let result = ''
 
-function repeat(string, count) {
-  var result = '', cycle;
-
-  for (cycle = 0; cycle < count; cycle += 1) {
-    result += string;
+  for (let cycle = 0; cycle < count; cycle += 1) {
+    result += string
   }
 
-  return result;
+  return result
 }
 
-
-function isNegativeZero(number) {
-  return (number === 0) && (Number.NEGATIVE_INFINITY === 1 / number);
+function isNegativeZero (number) {
+  return (number === 0) && (Number.NEGATIVE_INFINITY === 1 / number)
 }
 
-
-module.exports.isNothing      = isNothing;
-module.exports.isObject       = isObject;
-module.exports.toArray        = toArray;
-module.exports.repeat         = repeat;
-module.exports.isNegativeZero = isNegativeZero;
-module.exports.extend         = extend;
+module.exports.isNothing = isNothing
+module.exports.isObject = isObject
+module.exports.toArray = toArray
+module.exports.repeat = repeat
+module.exports.isNegativeZero = isNegativeZero
+module.exports.extend = extend
 
 
 /***/ }),
@@ -33937,203 +32327,196 @@ module.exports.extend         = extend;
 "use strict";
 
 
-/*eslint-disable no-use-before-define*/
+const common = __nccwpck_require__(19816)
+const YAMLException = __nccwpck_require__(41248)
+const DEFAULT_SCHEMA = __nccwpck_require__(97336)
 
-var common              = __nccwpck_require__(19816);
-var YAMLException       = __nccwpck_require__(41248);
-var DEFAULT_SCHEMA      = __nccwpck_require__(97336);
+const _toString = Object.prototype.toString
+const _hasOwnProperty = Object.prototype.hasOwnProperty
 
-var _toString       = Object.prototype.toString;
-var _hasOwnProperty = Object.prototype.hasOwnProperty;
+const CHAR_BOM = 0xFEFF
+const CHAR_TAB = 0x09 /* Tab */
+const CHAR_LINE_FEED = 0x0A /* LF */
+const CHAR_CARRIAGE_RETURN = 0x0D /* CR */
+const CHAR_SPACE = 0x20 /* Space */
+const CHAR_EXCLAMATION = 0x21 /* ! */
+const CHAR_DOUBLE_QUOTE = 0x22 /* " */
+const CHAR_SHARP = 0x23 /* # */
+const CHAR_PERCENT = 0x25 /* % */
+const CHAR_AMPERSAND = 0x26 /* & */
+const CHAR_SINGLE_QUOTE = 0x27 /* ' */
+const CHAR_ASTERISK = 0x2A /* * */
+const CHAR_COMMA = 0x2C /* , */
+const CHAR_MINUS = 0x2D /* - */
+const CHAR_COLON = 0x3A /* : */
+const CHAR_EQUALS = 0x3D /* = */
+const CHAR_GREATER_THAN = 0x3E /* > */
+const CHAR_QUESTION = 0x3F /* ? */
+const CHAR_COMMERCIAL_AT = 0x40 /* @ */
+const CHAR_LEFT_SQUARE_BRACKET = 0x5B /* [ */
+const CHAR_RIGHT_SQUARE_BRACKET = 0x5D /* ] */
+const CHAR_GRAVE_ACCENT = 0x60 /* ` */
+const CHAR_LEFT_CURLY_BRACKET = 0x7B /* { */
+const CHAR_VERTICAL_LINE = 0x7C /* | */
+const CHAR_RIGHT_CURLY_BRACKET = 0x7D /* } */
 
-var CHAR_BOM                  = 0xFEFF;
-var CHAR_TAB                  = 0x09; /* Tab */
-var CHAR_LINE_FEED            = 0x0A; /* LF */
-var CHAR_CARRIAGE_RETURN      = 0x0D; /* CR */
-var CHAR_SPACE                = 0x20; /* Space */
-var CHAR_EXCLAMATION          = 0x21; /* ! */
-var CHAR_DOUBLE_QUOTE         = 0x22; /* " */
-var CHAR_SHARP                = 0x23; /* # */
-var CHAR_PERCENT              = 0x25; /* % */
-var CHAR_AMPERSAND            = 0x26; /* & */
-var CHAR_SINGLE_QUOTE         = 0x27; /* ' */
-var CHAR_ASTERISK             = 0x2A; /* * */
-var CHAR_COMMA                = 0x2C; /* , */
-var CHAR_MINUS                = 0x2D; /* - */
-var CHAR_COLON                = 0x3A; /* : */
-var CHAR_EQUALS               = 0x3D; /* = */
-var CHAR_GREATER_THAN         = 0x3E; /* > */
-var CHAR_QUESTION             = 0x3F; /* ? */
-var CHAR_COMMERCIAL_AT        = 0x40; /* @ */
-var CHAR_LEFT_SQUARE_BRACKET  = 0x5B; /* [ */
-var CHAR_RIGHT_SQUARE_BRACKET = 0x5D; /* ] */
-var CHAR_GRAVE_ACCENT         = 0x60; /* ` */
-var CHAR_LEFT_CURLY_BRACKET   = 0x7B; /* { */
-var CHAR_VERTICAL_LINE        = 0x7C; /* | */
-var CHAR_RIGHT_CURLY_BRACKET  = 0x7D; /* } */
+const ESCAPE_SEQUENCES = {}
 
-var ESCAPE_SEQUENCES = {};
+ESCAPE_SEQUENCES[0x00] = '\\0'
+ESCAPE_SEQUENCES[0x07] = '\\a'
+ESCAPE_SEQUENCES[0x08] = '\\b'
+ESCAPE_SEQUENCES[0x09] = '\\t'
+ESCAPE_SEQUENCES[0x0A] = '\\n'
+ESCAPE_SEQUENCES[0x0B] = '\\v'
+ESCAPE_SEQUENCES[0x0C] = '\\f'
+ESCAPE_SEQUENCES[0x0D] = '\\r'
+ESCAPE_SEQUENCES[0x1B] = '\\e'
+ESCAPE_SEQUENCES[0x22] = '\\"'
+ESCAPE_SEQUENCES[0x5C] = '\\\\'
+ESCAPE_SEQUENCES[0x85] = '\\N'
+ESCAPE_SEQUENCES[0xA0] = '\\_'
+ESCAPE_SEQUENCES[0x2028] = '\\L'
+ESCAPE_SEQUENCES[0x2029] = '\\P'
 
-ESCAPE_SEQUENCES[0x00]   = '\\0';
-ESCAPE_SEQUENCES[0x07]   = '\\a';
-ESCAPE_SEQUENCES[0x08]   = '\\b';
-ESCAPE_SEQUENCES[0x09]   = '\\t';
-ESCAPE_SEQUENCES[0x0A]   = '\\n';
-ESCAPE_SEQUENCES[0x0B]   = '\\v';
-ESCAPE_SEQUENCES[0x0C]   = '\\f';
-ESCAPE_SEQUENCES[0x0D]   = '\\r';
-ESCAPE_SEQUENCES[0x1B]   = '\\e';
-ESCAPE_SEQUENCES[0x22]   = '\\"';
-ESCAPE_SEQUENCES[0x5C]   = '\\\\';
-ESCAPE_SEQUENCES[0x85]   = '\\N';
-ESCAPE_SEQUENCES[0xA0]   = '\\_';
-ESCAPE_SEQUENCES[0x2028] = '\\L';
-ESCAPE_SEQUENCES[0x2029] = '\\P';
-
-var DEPRECATED_BOOLEANS_SYNTAX = [
+const DEPRECATED_BOOLEANS_SYNTAX = [
   'y', 'Y', 'yes', 'Yes', 'YES', 'on', 'On', 'ON',
   'n', 'N', 'no', 'No', 'NO', 'off', 'Off', 'OFF'
-];
+]
 
-var DEPRECATED_BASE60_SYNTAX = /^[-+]?[0-9_]+(?::[0-9_]+)+(?:\.[0-9_]*)?$/;
+const DEPRECATED_BASE60_SYNTAX = /^[-+]?[0-9_]+(?::[0-9_]+)+(?:\.[0-9_]*)?$/
 
-function compileStyleMap(schema, map) {
-  var result, keys, index, length, tag, style, type;
+function compileStyleMap (schema, map) {
+  if (map === null) return {}
 
-  if (map === null) return {};
+  const result = {}
+  const keys = Object.keys(map)
 
-  result = {};
-  keys = Object.keys(map);
-
-  for (index = 0, length = keys.length; index < length; index += 1) {
-    tag = keys[index];
-    style = String(map[tag]);
+  for (let index = 0, length = keys.length; index < length; index += 1) {
+    let tag = keys[index]
+    let style = String(map[tag])
 
     if (tag.slice(0, 2) === '!!') {
-      tag = 'tag:yaml.org,2002:' + tag.slice(2);
+      tag = 'tag:yaml.org,2002:' + tag.slice(2)
     }
-    type = schema.compiledTypeMap['fallback'][tag];
+    const type = schema.compiledTypeMap['fallback'][tag]
 
     if (type && _hasOwnProperty.call(type.styleAliases, style)) {
-      style = type.styleAliases[style];
+      style = type.styleAliases[style]
     }
 
-    result[tag] = style;
+    result[tag] = style
   }
 
-  return result;
+  return result
 }
 
-function encodeHex(character) {
-  var string, handle, length;
+function encodeHex (character) {
+  let handle
+  let length
 
-  string = character.toString(16).toUpperCase();
+  const string = character.toString(16).toUpperCase()
 
   if (character <= 0xFF) {
-    handle = 'x';
-    length = 2;
+    handle = 'x'
+    length = 2
   } else if (character <= 0xFFFF) {
-    handle = 'u';
-    length = 4;
+    handle = 'u'
+    length = 4
   } else if (character <= 0xFFFFFFFF) {
-    handle = 'U';
-    length = 8;
+    handle = 'U'
+    length = 8
   } else {
-    throw new YAMLException('code point within a string may not be greater than 0xFFFFFFFF');
+    throw new YAMLException('code point within a string may not be greater than 0xFFFFFFFF')
   }
 
-  return '\\' + handle + common.repeat('0', length - string.length) + string;
+  return '\\' + handle + common.repeat('0', length - string.length) + string
 }
 
+const QUOTING_TYPE_SINGLE = 1
+const QUOTING_TYPE_DOUBLE = 2
 
-var QUOTING_TYPE_SINGLE = 1,
-    QUOTING_TYPE_DOUBLE = 2;
+function State (options) {
+  this.schema = options['schema'] || DEFAULT_SCHEMA
+  this.indent = Math.max(1, (options['indent'] || 2))
+  this.noArrayIndent = options['noArrayIndent'] || false
+  this.skipInvalid = options['skipInvalid'] || false
+  this.flowLevel = (common.isNothing(options['flowLevel']) ? -1 : options['flowLevel'])
+  this.styleMap = compileStyleMap(this.schema, options['styles'] || null)
+  this.sortKeys = options['sortKeys'] || false
+  this.lineWidth = options['lineWidth'] || 80
+  this.noRefs = options['noRefs'] || false
+  this.noCompatMode = options['noCompatMode'] || false
+  this.condenseFlow = options['condenseFlow'] || false
+  this.quotingType = options['quotingType'] === '"' ? QUOTING_TYPE_DOUBLE : QUOTING_TYPE_SINGLE
+  this.forceQuotes = options['forceQuotes'] || false
+  this.replacer = typeof options['replacer'] === 'function' ? options['replacer'] : null
 
-function State(options) {
-  this.schema        = options['schema'] || DEFAULT_SCHEMA;
-  this.indent        = Math.max(1, (options['indent'] || 2));
-  this.noArrayIndent = options['noArrayIndent'] || false;
-  this.skipInvalid   = options['skipInvalid'] || false;
-  this.flowLevel     = (common.isNothing(options['flowLevel']) ? -1 : options['flowLevel']);
-  this.styleMap      = compileStyleMap(this.schema, options['styles'] || null);
-  this.sortKeys      = options['sortKeys'] || false;
-  this.lineWidth     = options['lineWidth'] || 80;
-  this.noRefs        = options['noRefs'] || false;
-  this.noCompatMode  = options['noCompatMode'] || false;
-  this.condenseFlow  = options['condenseFlow'] || false;
-  this.quotingType   = options['quotingType'] === '"' ? QUOTING_TYPE_DOUBLE : QUOTING_TYPE_SINGLE;
-  this.forceQuotes   = options['forceQuotes'] || false;
-  this.replacer      = typeof options['replacer'] === 'function' ? options['replacer'] : null;
+  this.implicitTypes = this.schema.compiledImplicit
+  this.explicitTypes = this.schema.compiledExplicit
 
-  this.implicitTypes = this.schema.compiledImplicit;
-  this.explicitTypes = this.schema.compiledExplicit;
+  this.tag = null
+  this.result = ''
 
-  this.tag = null;
-  this.result = '';
-
-  this.duplicates = [];
-  this.usedDuplicates = null;
+  this.duplicates = []
+  this.usedDuplicates = null
 }
 
 // Indents every line in a string. Empty lines (\n only) are not indented.
-function indentString(string, spaces) {
-  var ind = common.repeat(' ', spaces),
-      position = 0,
-      next = -1,
-      result = '',
-      line,
-      length = string.length;
+function indentString (string, spaces) {
+  const ind = common.repeat(' ', spaces)
+  let position = 0
+  let result = ''
+  const length = string.length
 
   while (position < length) {
-    next = string.indexOf('\n', position);
+    let line
+    const next = string.indexOf('\n', position)
     if (next === -1) {
-      line = string.slice(position);
-      position = length;
+      line = string.slice(position)
+      position = length
     } else {
-      line = string.slice(position, next + 1);
-      position = next + 1;
+      line = string.slice(position, next + 1)
+      position = next + 1
     }
 
-    if (line.length && line !== '\n') result += ind;
+    if (line.length && line !== '\n') result += ind
 
-    result += line;
+    result += line
   }
 
-  return result;
+  return result
 }
 
-function generateNextLine(state, level) {
-  return '\n' + common.repeat(' ', state.indent * level);
+function generateNextLine (state, level) {
+  return '\n' + common.repeat(' ', state.indent * level)
 }
 
-function testImplicitResolving(state, str) {
-  var index, length, type;
-
-  for (index = 0, length = state.implicitTypes.length; index < length; index += 1) {
-    type = state.implicitTypes[index];
+function testImplicitResolving (state, str) {
+  for (let index = 0, length = state.implicitTypes.length; index < length; index += 1) {
+    const type = state.implicitTypes[index]
 
     if (type.resolve(str)) {
-      return true;
+      return true
     }
   }
 
-  return false;
+  return false
 }
 
 // [33] s-white ::= s-space | s-tab
-function isWhitespace(c) {
-  return c === CHAR_SPACE || c === CHAR_TAB;
+function isWhitespace (c) {
+  return c === CHAR_SPACE || c === CHAR_TAB
 }
 
 // Returns true if the character can be printed without escaping.
 // From YAML 1.2: "any allowed characters known to be non-printable
 // should also be escaped. [However,] This isn’t mandatory"
 // Derived from nb-char - \t - #x85 - #xA0 - #x2028 - #x2029.
-function isPrintable(c) {
-  return  (0x00020 <= c && c <= 0x00007E)
-      || ((0x000A1 <= c && c <= 0x00D7FF) && c !== 0x2028 && c !== 0x2029)
-      || ((0x0E000 <= c && c <= 0x00FFFD) && c !== CHAR_BOM)
-      ||  (0x10000 <= c && c <= 0x10FFFF);
+function isPrintable (c) {
+  return (c >= 0x00020 && c <= 0x00007E) ||
+    ((c >= 0x000A1 && c <= 0x00D7FF) && c !== 0x2028 && c !== 0x2029) ||
+    ((c >= 0x0E000 && c <= 0x00FFFD) && c !== CHAR_BOM) ||
+    (c >= 0x10000 && c <= 0x10FFFF)
 }
 
 // [34] ns-char ::= nb-char - s-white
@@ -34141,12 +32524,12 @@ function isPrintable(c) {
 // [26] b-char  ::= b-line-feed | b-carriage-return
 // Including s-white (for some reason, examples doesn't match specs in this aspect)
 // ns-char ::= c-printable - b-line-feed - b-carriage-return - c-byte-order-mark
-function isNsCharOrWhitespace(c) {
-  return isPrintable(c)
-    && c !== CHAR_BOM
+function isNsCharOrWhitespace (c) {
+  return isPrintable(c) &&
+    c !== CHAR_BOM &&
     // - b-char
-    && c !== CHAR_CARRIAGE_RETURN
-    && c !== CHAR_LINE_FEED;
+    c !== CHAR_CARRIAGE_RETURN &&
+    c !== CHAR_LINE_FEED
 }
 
 // [127]  ns-plain-safe(c) ::= c = flow-out  ⇒ ns-plain-safe-out
@@ -34158,91 +32541,96 @@ function isNsCharOrWhitespace(c) {
 // [130]  ns-plain-char(c) ::=  ( ns-plain-safe(c) - “:” - “#” )
 //                            | ( /* An ns-char preceding */ “#” )
 //                            | ( “:” /* Followed by an ns-plain-safe(c) */ )
-function isPlainSafe(c, prev, inblock) {
-  var cIsNsCharOrWhitespace = isNsCharOrWhitespace(c);
-  var cIsNsChar = cIsNsCharOrWhitespace && !isWhitespace(c);
+function isPlainSafe (c, prev, inblock) {
+  const cIsNsCharOrWhitespace = isNsCharOrWhitespace(c)
+  const cIsNsChar = cIsNsCharOrWhitespace && !isWhitespace(c)
   return (
-    // ns-plain-safe
-    inblock ? // c = flow-in
-      cIsNsCharOrWhitespace
-      : cIsNsCharOrWhitespace
-        // - c-flow-indicator
-        && c !== CHAR_COMMA
-        && c !== CHAR_LEFT_SQUARE_BRACKET
-        && c !== CHAR_RIGHT_SQUARE_BRACKET
-        && c !== CHAR_LEFT_CURLY_BRACKET
-        && c !== CHAR_RIGHT_CURLY_BRACKET
-  )
+    (
+      // ns-plain-safe
+      inblock // c = flow-in
+        ? cIsNsCharOrWhitespace
+        : cIsNsCharOrWhitespace &&
+          // - c-flow-indicator
+          c !== CHAR_COMMA &&
+          c !== CHAR_LEFT_SQUARE_BRACKET &&
+          c !== CHAR_RIGHT_SQUARE_BRACKET &&
+          c !== CHAR_LEFT_CURLY_BRACKET &&
+          c !== CHAR_RIGHT_CURLY_BRACKET
+    ) &&
     // ns-plain-char
-    && c !== CHAR_SHARP // false on '#'
-    && !(prev === CHAR_COLON && !cIsNsChar) // false on ': '
-    || (isNsCharOrWhitespace(prev) && !isWhitespace(prev) && c === CHAR_SHARP) // change to true on '[^ ]#'
-    || (prev === CHAR_COLON && cIsNsChar); // change to true on ':[^ ]'
+    c !== CHAR_SHARP && // false on '#'
+    !(prev === CHAR_COLON && !cIsNsChar)
+  ) || // false on ': '
+  (isNsCharOrWhitespace(prev) && !isWhitespace(prev) && c === CHAR_SHARP) || // change to true on '[^ ]#'
+  (prev === CHAR_COLON && cIsNsChar) // change to true on ':[^ ]'
 }
 
 // Simplified test for values allowed as the first character in plain style.
-function isPlainSafeFirst(c) {
+function isPlainSafeFirst (c) {
   // Uses a subset of ns-char - c-indicator
   // where ns-char = nb-char - s-white.
   // No support of ( ( “?” | “:” | “-” ) /* Followed by an ns-plain-safe(c)) */ ) part
-  return isPrintable(c) && c !== CHAR_BOM
-    && !isWhitespace(c) // - s-white
+  return isPrintable(c) &&
+    c !== CHAR_BOM &&
+    !isWhitespace(c) && // - s-white
     // - (c-indicator ::=
     // “-” | “?” | “:” | “,” | “[” | “]” | “{” | “}”
-    && c !== CHAR_MINUS
-    && c !== CHAR_QUESTION
-    && c !== CHAR_COLON
-    && c !== CHAR_COMMA
-    && c !== CHAR_LEFT_SQUARE_BRACKET
-    && c !== CHAR_RIGHT_SQUARE_BRACKET
-    && c !== CHAR_LEFT_CURLY_BRACKET
-    && c !== CHAR_RIGHT_CURLY_BRACKET
+    c !== CHAR_MINUS &&
+    c !== CHAR_QUESTION &&
+    c !== CHAR_COLON &&
+    c !== CHAR_COMMA &&
+    c !== CHAR_LEFT_SQUARE_BRACKET &&
+    c !== CHAR_RIGHT_SQUARE_BRACKET &&
+    c !== CHAR_LEFT_CURLY_BRACKET &&
+    c !== CHAR_RIGHT_CURLY_BRACKET &&
     // | “#” | “&” | “*” | “!” | “|” | “=” | “>” | “'” | “"”
-    && c !== CHAR_SHARP
-    && c !== CHAR_AMPERSAND
-    && c !== CHAR_ASTERISK
-    && c !== CHAR_EXCLAMATION
-    && c !== CHAR_VERTICAL_LINE
-    && c !== CHAR_EQUALS
-    && c !== CHAR_GREATER_THAN
-    && c !== CHAR_SINGLE_QUOTE
-    && c !== CHAR_DOUBLE_QUOTE
+    c !== CHAR_SHARP &&
+    c !== CHAR_AMPERSAND &&
+    c !== CHAR_ASTERISK &&
+    c !== CHAR_EXCLAMATION &&
+    c !== CHAR_VERTICAL_LINE &&
+    c !== CHAR_EQUALS &&
+    c !== CHAR_GREATER_THAN &&
+    c !== CHAR_SINGLE_QUOTE &&
+    c !== CHAR_DOUBLE_QUOTE &&
     // | “%” | “@” | “`”)
-    && c !== CHAR_PERCENT
-    && c !== CHAR_COMMERCIAL_AT
-    && c !== CHAR_GRAVE_ACCENT;
+    c !== CHAR_PERCENT &&
+    c !== CHAR_COMMERCIAL_AT &&
+    c !== CHAR_GRAVE_ACCENT
 }
 
 // Simplified test for values allowed as the last character in plain style.
-function isPlainSafeLast(c) {
+function isPlainSafeLast (c) {
   // just not whitespace or colon, it will be checked to be plain character later
-  return !isWhitespace(c) && c !== CHAR_COLON;
+  return !isWhitespace(c) && c !== CHAR_COLON
 }
 
 // Same as 'string'.codePointAt(pos), but works in older browsers.
-function codePointAt(string, pos) {
-  var first = string.charCodeAt(pos), second;
+function codePointAt (string, pos) {
+  const first = string.charCodeAt(pos)
+  let second
+
   if (first >= 0xD800 && first <= 0xDBFF && pos + 1 < string.length) {
-    second = string.charCodeAt(pos + 1);
+    second = string.charCodeAt(pos + 1)
     if (second >= 0xDC00 && second <= 0xDFFF) {
       // https://mathiasbynens.be/notes/javascript-encoding#surrogate-formulae
-      return (first - 0xD800) * 0x400 + second - 0xDC00 + 0x10000;
+      return (first - 0xD800) * 0x400 + second - 0xDC00 + 0x10000
     }
   }
-  return first;
+  return first
 }
 
 // Determines whether block indentation indicator is required.
-function needIndentIndicator(string) {
-  var leadingSpaceRe = /^\n* /;
-  return leadingSpaceRe.test(string);
+function needIndentIndicator (string) {
+  const leadingSpaceRe = /^\n* /
+  return leadingSpaceRe.test(string)
 }
 
-var STYLE_PLAIN   = 1,
-    STYLE_SINGLE  = 2,
-    STYLE_LITERAL = 3,
-    STYLE_FOLDED  = 4,
-    STYLE_DOUBLE  = 5;
+const STYLE_PLAIN = 1
+const STYLE_SINGLE = 2
+const STYLE_LITERAL = 3
+const STYLE_FOLDED = 4
+const STYLE_DOUBLE = 5
 
 // Determines which scalar styles are possible and returns the preferred style.
 // lineWidth = -1 => no limit.
@@ -34251,54 +32639,53 @@ var STYLE_PLAIN   = 1,
 //    STYLE_PLAIN or STYLE_SINGLE => no \n are in the string.
 //    STYLE_LITERAL => no lines are suitable for folding (or lineWidth is -1).
 //    STYLE_FOLDED => a line > lineWidth and can be folded (and lineWidth != -1).
-function chooseScalarStyle(string, singleLineOnly, indentPerLevel, lineWidth,
+function chooseScalarStyle (string, singleLineOnly, indentPerLevel, lineWidth,
   testAmbiguousType, quotingType, forceQuotes, inblock) {
-
-  var i;
-  var char = 0;
-  var prevChar = null;
-  var hasLineBreak = false;
-  var hasFoldableLine = false; // only checked if shouldTrackWidth
-  var shouldTrackWidth = lineWidth !== -1;
-  var previousLineBreak = -1; // count the first line correctly
-  var plain = isPlainSafeFirst(codePointAt(string, 0))
-          && isPlainSafeLast(codePointAt(string, string.length - 1));
+  let i
+  let char = 0
+  let prevChar = null
+  let hasLineBreak = false
+  let hasFoldableLine = false // only checked if shouldTrackWidth
+  const shouldTrackWidth = lineWidth !== -1
+  let previousLineBreak = -1 // count the first line correctly
+  let plain = isPlainSafeFirst(codePointAt(string, 0)) &&
+    isPlainSafeLast(codePointAt(string, string.length - 1))
 
   if (singleLineOnly || forceQuotes) {
     // Case: no block styles.
     // Check for disallowed characters to rule out plain and single.
     for (i = 0; i < string.length; char >= 0x10000 ? i += 2 : i++) {
-      char = codePointAt(string, i);
+      char = codePointAt(string, i)
       if (!isPrintable(char)) {
-        return STYLE_DOUBLE;
+        return STYLE_DOUBLE
       }
-      plain = plain && isPlainSafe(char, prevChar, inblock);
-      prevChar = char;
+      plain = plain && isPlainSafe(char, prevChar, inblock)
+      prevChar = char
     }
   } else {
     // Case: block styles permitted.
     for (i = 0; i < string.length; char >= 0x10000 ? i += 2 : i++) {
-      char = codePointAt(string, i);
+      char = codePointAt(string, i)
       if (char === CHAR_LINE_FEED) {
-        hasLineBreak = true;
+        hasLineBreak = true
         // Check if any line can be folded.
         if (shouldTrackWidth) {
           hasFoldableLine = hasFoldableLine ||
             // Foldable line = too long, and not more-indented.
             (i - previousLineBreak - 1 > lineWidth &&
-             string[previousLineBreak + 1] !== ' ');
-          previousLineBreak = i;
+             string[previousLineBreak + 1] !== ' ')
+          previousLineBreak = i
         }
       } else if (!isPrintable(char)) {
-        return STYLE_DOUBLE;
+        return STYLE_DOUBLE
       }
-      plain = plain && isPlainSafe(char, prevChar, inblock);
-      prevChar = char;
+      plain = plain && isPlainSafe(char, prevChar, inblock)
+      prevChar = char
     }
     // in case the end is missing a \n
     hasFoldableLine = hasFoldableLine || (shouldTrackWidth &&
       (i - previousLineBreak - 1 > lineWidth &&
-       string[previousLineBreak + 1] !== ' '));
+       string[previousLineBreak + 1] !== ' '))
   }
   // Although every style can represent \n without escaping, prefer block styles
   // for multiline, since they're more readable and they don't add empty lines.
@@ -34307,20 +32694,20 @@ function chooseScalarStyle(string, singleLineOnly, indentPerLevel, lineWidth,
     // Strings interpretable as another type have to be quoted;
     // e.g. the string 'true' vs. the boolean true.
     if (plain && !forceQuotes && !testAmbiguousType(string)) {
-      return STYLE_PLAIN;
+      return STYLE_PLAIN
     }
-    return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE;
+    return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE
   }
   // Edge case: block indentation indicator can only have one digit.
   if (indentPerLevel > 9 && needIndentIndicator(string)) {
-    return STYLE_DOUBLE;
+    return STYLE_DOUBLE
   }
   // At this point we know block styles are valid.
   // Prefer literal style unless we want to fold.
   if (!forceQuotes) {
-    return hasFoldableLine ? STYLE_FOLDED : STYLE_LITERAL;
+    return hasFoldableLine ? STYLE_FOLDED : STYLE_LITERAL
   }
-  return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE;
+  return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE
 }
 
 // Note: line breaking/folding is implemented for only the folded style.
@@ -34329,18 +32716,18 @@ function chooseScalarStyle(string, singleLineOnly, indentPerLevel, lineWidth,
 //    • No ending newline => unaffected; already using strip "-" chomping.
 //    • Ending newline    => removed then restored.
 //  Importantly, this keeps the "+" chomp indicator from gaining an extra line.
-function writeScalar(state, string, level, iskey, inblock) {
+function writeScalar (state, string, level, iskey, inblock) {
   state.dump = (function () {
     if (string.length === 0) {
-      return state.quotingType === QUOTING_TYPE_DOUBLE ? '""' : "''";
+      return state.quotingType === QUOTING_TYPE_DOUBLE ? '""' : "''"
     }
     if (!state.noCompatMode) {
       if (DEPRECATED_BOOLEANS_SYNTAX.indexOf(string) !== -1 || DEPRECATED_BASE60_SYNTAX.test(string)) {
-        return state.quotingType === QUOTING_TYPE_DOUBLE ? ('"' + string + '"') : ("'" + string + "'");
+        return state.quotingType === QUOTING_TYPE_DOUBLE ? ('"' + string + '"') : ("'" + string + "'")
       }
     }
 
-    var indent = state.indent * Math.max(1, level); // no 0-indent scalars
+    const indent = state.indent * Math.max(1, level) // no 0-indent scalars
     // As indentation gets deeper, let the width decrease monotonically
     // to the lower bound min(state.lineWidth, 40).
     // Note that this implies
@@ -34348,461 +32735,441 @@ function writeScalar(state, string, level, iskey, inblock) {
     //  state.lineWidth > 40 + state.indent: width decreases until the lower bound.
     // This behaves better than a constant minimum width which disallows narrower options,
     // or an indent threshold which causes the width to suddenly increase.
-    var lineWidth = state.lineWidth === -1
-      ? -1 : Math.max(Math.min(state.lineWidth, 40), state.lineWidth - indent);
+    const lineWidth = (state.lineWidth === -1)
+      ? -1
+      : Math.max(Math.min(state.lineWidth, 40), state.lineWidth - indent)
 
     // Without knowing if keys are implicit/explicit, assume implicit for safety.
-    var singleLineOnly = iskey
+    const singleLineOnly = iskey ||
       // No block styles in flow mode.
-      || (state.flowLevel > -1 && level >= state.flowLevel);
-    function testAmbiguity(string) {
-      return testImplicitResolving(state, string);
+      (state.flowLevel > -1 && level >= state.flowLevel)
+    function testAmbiguity (string) {
+      return testImplicitResolving(state, string)
     }
 
     switch (chooseScalarStyle(string, singleLineOnly, state.indent, lineWidth,
       testAmbiguity, state.quotingType, state.forceQuotes && !iskey, inblock)) {
-
       case STYLE_PLAIN:
-        return string;
+        return string
       case STYLE_SINGLE:
-        return "'" + string.replace(/'/g, "''") + "'";
+        return "'" + string.replace(/'/g, "''") + "'"
       case STYLE_LITERAL:
-        return '|' + blockHeader(string, state.indent)
-          + dropEndingNewline(indentString(string, indent));
+        return '|' + blockHeader(string, state.indent) +
+          dropEndingNewline(indentString(string, indent))
       case STYLE_FOLDED:
-        return '>' + blockHeader(string, state.indent)
-          + dropEndingNewline(indentString(foldString(string, lineWidth), indent));
+        return '>' + blockHeader(string, state.indent) +
+          dropEndingNewline(indentString(foldString(string, lineWidth), indent))
       case STYLE_DOUBLE:
-        return '"' + escapeString(string, lineWidth) + '"';
+        return '"' + escapeString(string, lineWidth) + '"'
       default:
-        throw new YAMLException('impossible error: invalid scalar style');
+        throw new YAMLException('impossible error: invalid scalar style')
     }
-  }());
+  }())
 }
 
 // Pre-conditions: string is valid for a block scalar, 1 <= indentPerLevel <= 9.
-function blockHeader(string, indentPerLevel) {
-  var indentIndicator = needIndentIndicator(string) ? String(indentPerLevel) : '';
+function blockHeader (string, indentPerLevel) {
+  const indentIndicator = needIndentIndicator(string) ? String(indentPerLevel) : ''
 
   // note the special case: the string '\n' counts as a "trailing" empty line.
-  var clip =          string[string.length - 1] === '\n';
-  var keep = clip && (string[string.length - 2] === '\n' || string === '\n');
-  var chomp = keep ? '+' : (clip ? '' : '-');
+  const clip = string[string.length - 1] === '\n'
+  const keep = clip && (string[string.length - 2] === '\n' || string === '\n')
+  const chomp = keep ? '+' : (clip ? '' : '-')
 
-  return indentIndicator + chomp + '\n';
+  return indentIndicator + chomp + '\n'
 }
 
 // (See the note for writeScalar.)
-function dropEndingNewline(string) {
-  return string[string.length - 1] === '\n' ? string.slice(0, -1) : string;
+function dropEndingNewline (string) {
+  return string[string.length - 1] === '\n' ? string.slice(0, -1) : string
 }
 
 // Note: a long line without a suitable break point will exceed the width limit.
 // Pre-conditions: every char in str isPrintable, str.length > 0, width > 0.
-function foldString(string, width) {
+function foldString (string, width) {
   // In folded style, $k$ consecutive newlines output as $k+1$ newlines—
   // unless they're before or after a more-indented line, or at the very
   // beginning or end, in which case $k$ maps to $k$.
   // Therefore, parse each chunk as newline(s) followed by a content line.
-  var lineRe = /(\n+)([^\n]*)/g;
+  const lineRe = /(\n+)([^\n]*)/g
 
   // first line (possibly an empty line)
-  var result = (function () {
-    var nextLF = string.indexOf('\n');
-    nextLF = nextLF !== -1 ? nextLF : string.length;
-    lineRe.lastIndex = nextLF;
-    return foldLine(string.slice(0, nextLF), width);
-  }());
+  let result = (function () {
+    let nextLF = string.indexOf('\n')
+    nextLF = nextLF !== -1 ? nextLF : string.length
+    lineRe.lastIndex = nextLF
+    return foldLine(string.slice(0, nextLF), width)
+  }())
   // If we haven't reached the first content line yet, don't add an extra \n.
-  var prevMoreIndented = string[0] === '\n' || string[0] === ' ';
-  var moreIndented;
+  let prevMoreIndented = string[0] === '\n' || string[0] === ' '
+  let moreIndented
 
   // rest of the lines
-  var match;
+  let match
   while ((match = lineRe.exec(string))) {
-    var prefix = match[1], line = match[2];
-    moreIndented = (line[0] === ' ');
-    result += prefix
-      + (!prevMoreIndented && !moreIndented && line !== ''
-        ? '\n' : '')
-      + foldLine(line, width);
-    prevMoreIndented = moreIndented;
+    const prefix = match[1]
+    const line = match[2]
+
+    moreIndented = (line[0] === ' ')
+    result += prefix +
+      ((!prevMoreIndented && !moreIndented && line !== '') ? '\n' : '') +
+      foldLine(line, width)
+    prevMoreIndented = moreIndented
   }
 
-  return result;
+  return result
 }
 
 // Greedy line breaking.
 // Picks the longest line under the limit each time,
 // otherwise settles for the shortest line over the limit.
 // NB. More-indented lines *cannot* be folded, as that would add an extra \n.
-function foldLine(line, width) {
-  if (line === '' || line[0] === ' ') return line;
+function foldLine (line, width) {
+  if (line === '' || line[0] === ' ') return line
 
   // Since a more-indented line adds a \n, breaks can't be followed by a space.
-  var breakRe = / [^ ]/g; // note: the match index will always be <= length-2.
-  var match;
+  const breakRe = / [^ ]/g // note: the match index will always be <= length-2.
+  let match
   // start is an inclusive index. end, curr, and next are exclusive.
-  var start = 0, end, curr = 0, next = 0;
-  var result = '';
+  let start = 0
+  let end
+  let curr = 0
+  let next = 0
+  let result = ''
 
   // Invariants: 0 <= start <= length-1.
   //   0 <= curr <= next <= max(0, length-2). curr - start <= width.
   // Inside the loop:
   //   A match implies length >= 2, so curr and next are <= length-2.
   while ((match = breakRe.exec(line))) {
-    next = match.index;
+    next = match.index
     // maintain invariant: curr - start <= width
     if (next - start > width) {
-      end = (curr > start) ? curr : next; // derive end <= length-2
-      result += '\n' + line.slice(start, end);
+      end = (curr > start) ? curr : next // derive end <= length-2
+      result += '\n' + line.slice(start, end)
       // skip the space that was output as \n
-      start = end + 1;                    // derive start <= length-1
+      start = end + 1                    // derive start <= length-1
     }
-    curr = next;
+    curr = next
   }
 
   // By the invariants, start <= length-1, so there is something left over.
   // It is either the whole string or a part starting from non-whitespace.
-  result += '\n';
+  result += '\n'
   // Insert a break if the remainder is too long and there is a break available.
   if (line.length - start > width && curr > start) {
-    result += line.slice(start, curr) + '\n' + line.slice(curr + 1);
+    result += line.slice(start, curr) + '\n' + line.slice(curr + 1)
   } else {
-    result += line.slice(start);
+    result += line.slice(start)
   }
 
-  return result.slice(1); // drop extra \n joiner
+  return result.slice(1) // drop extra \n joiner
 }
 
 // Escapes a double-quoted string.
-function escapeString(string) {
-  var result = '';
-  var char = 0;
-  var escapeSeq;
+function escapeString (string) {
+  let result = ''
+  let char = 0
 
-  for (var i = 0; i < string.length; char >= 0x10000 ? i += 2 : i++) {
-    char = codePointAt(string, i);
-    escapeSeq = ESCAPE_SEQUENCES[char];
+  for (let i = 0; i < string.length; char >= 0x10000 ? i += 2 : i++) {
+    char = codePointAt(string, i)
+    const escapeSeq = ESCAPE_SEQUENCES[char]
 
     if (!escapeSeq && isPrintable(char)) {
-      result += string[i];
-      if (char >= 0x10000) result += string[i + 1];
+      result += string[i]
+      if (char >= 0x10000) result += string[i + 1]
     } else {
-      result += escapeSeq || encodeHex(char);
+      result += escapeSeq || encodeHex(char)
     }
   }
 
-  return result;
+  return result
 }
 
-function writeFlowSequence(state, level, object) {
-  var _result = '',
-      _tag    = state.tag,
-      index,
-      length,
-      value;
+function writeFlowSequence (state, level, object) {
+  let _result = ''
+  const _tag = state.tag
 
-  for (index = 0, length = object.length; index < length; index += 1) {
-    value = object[index];
+  for (let index = 0, length = object.length; index < length; index += 1) {
+    let value = object[index]
 
     if (state.replacer) {
-      value = state.replacer.call(object, String(index), value);
+      value = state.replacer.call(object, String(index), value)
     }
 
     // Write only valid elements, put null instead of invalid elements.
     if (writeNode(state, level, value, false, false) ||
         (typeof value === 'undefined' &&
          writeNode(state, level, null, false, false))) {
-
-      if (_result !== '') _result += ',' + (!state.condenseFlow ? ' ' : '');
-      _result += state.dump;
+      if (_result !== '') _result += ',' + (!state.condenseFlow ? ' ' : '')
+      _result += state.dump
     }
   }
 
-  state.tag = _tag;
-  state.dump = '[' + _result + ']';
+  state.tag = _tag
+  state.dump = '[' + _result + ']'
 }
 
-function writeBlockSequence(state, level, object, compact) {
-  var _result = '',
-      _tag    = state.tag,
-      index,
-      length,
-      value;
+function writeBlockSequence (state, level, object, compact) {
+  let _result = ''
+  const _tag = state.tag
 
-  for (index = 0, length = object.length; index < length; index += 1) {
-    value = object[index];
+  for (let index = 0, length = object.length; index < length; index += 1) {
+    let value = object[index]
 
     if (state.replacer) {
-      value = state.replacer.call(object, String(index), value);
+      value = state.replacer.call(object, String(index), value)
     }
 
     // Write only valid elements, put null instead of invalid elements.
     if (writeNode(state, level + 1, value, true, true, false, true) ||
         (typeof value === 'undefined' &&
          writeNode(state, level + 1, null, true, true, false, true))) {
-
       if (!compact || _result !== '') {
-        _result += generateNextLine(state, level);
+        _result += generateNextLine(state, level)
       }
 
       if (state.dump && CHAR_LINE_FEED === state.dump.charCodeAt(0)) {
-        _result += '-';
+        _result += '-'
       } else {
-        _result += '- ';
+        _result += '- '
       }
 
-      _result += state.dump;
+      _result += state.dump
     }
   }
 
-  state.tag = _tag;
-  state.dump = _result || '[]'; // Empty sequence if no valid values.
+  state.tag = _tag
+  state.dump = _result || '[]' // Empty sequence if no valid values.
 }
 
-function writeFlowMapping(state, level, object) {
-  var _result       = '',
-      _tag          = state.tag,
-      objectKeyList = Object.keys(object),
-      index,
-      length,
-      objectKey,
-      objectValue,
-      pairBuffer;
+function writeFlowMapping (state, level, object) {
+  let _result = ''
+  const _tag = state.tag
+  const objectKeyList = Object.keys(object)
 
-  for (index = 0, length = objectKeyList.length; index < length; index += 1) {
+  for (let index = 0, length = objectKeyList.length; index < length; index += 1) {
+    let pairBuffer = ''
+    if (_result !== '') pairBuffer += ', '
 
-    pairBuffer = '';
-    if (_result !== '') pairBuffer += ', ';
+    if (state.condenseFlow) pairBuffer += '"'
 
-    if (state.condenseFlow) pairBuffer += '"';
-
-    objectKey = objectKeyList[index];
-    objectValue = object[objectKey];
+    const objectKey = objectKeyList[index]
+    let objectValue = object[objectKey]
 
     if (state.replacer) {
-      objectValue = state.replacer.call(object, objectKey, objectValue);
+      objectValue = state.replacer.call(object, objectKey, objectValue)
     }
 
     if (!writeNode(state, level, objectKey, false, false)) {
-      continue; // Skip this pair because of invalid key;
+      continue // Skip this pair because of invalid key;
     }
 
-    if (state.dump.length > 1024) pairBuffer += '? ';
+    if (state.dump.length > 1024) pairBuffer += '? '
 
-    pairBuffer += state.dump + (state.condenseFlow ? '"' : '') + ':' + (state.condenseFlow ? '' : ' ');
+    pairBuffer += state.dump + (state.condenseFlow ? '"' : '') + ':' + (state.condenseFlow ? '' : ' ')
 
     if (!writeNode(state, level, objectValue, false, false)) {
-      continue; // Skip this pair because of invalid value.
+      continue // Skip this pair because of invalid value.
     }
 
-    pairBuffer += state.dump;
+    pairBuffer += state.dump
 
     // Both key and value are valid.
-    _result += pairBuffer;
+    _result += pairBuffer
   }
 
-  state.tag = _tag;
-  state.dump = '{' + _result + '}';
+  state.tag = _tag
+  state.dump = '{' + _result + '}'
 }
 
-function writeBlockMapping(state, level, object, compact) {
-  var _result       = '',
-      _tag          = state.tag,
-      objectKeyList = Object.keys(object),
-      index,
-      length,
-      objectKey,
-      objectValue,
-      explicitPair,
-      pairBuffer;
+function writeBlockMapping (state, level, object, compact) {
+  let _result = ''
+  const _tag = state.tag
+  const objectKeyList = Object.keys(object)
 
   // Allow sorting keys so that the output file is deterministic
   if (state.sortKeys === true) {
     // Default sorting
-    objectKeyList.sort();
+    objectKeyList.sort()
   } else if (typeof state.sortKeys === 'function') {
     // Custom sort function
-    objectKeyList.sort(state.sortKeys);
+    objectKeyList.sort(state.sortKeys)
   } else if (state.sortKeys) {
     // Something is wrong
-    throw new YAMLException('sortKeys must be a boolean or a function');
+    throw new YAMLException('sortKeys must be a boolean or a function')
   }
 
-  for (index = 0, length = objectKeyList.length; index < length; index += 1) {
-    pairBuffer = '';
+  for (let index = 0, length = objectKeyList.length; index < length; index += 1) {
+    let pairBuffer = ''
 
     if (!compact || _result !== '') {
-      pairBuffer += generateNextLine(state, level);
+      pairBuffer += generateNextLine(state, level)
     }
 
-    objectKey = objectKeyList[index];
-    objectValue = object[objectKey];
+    const objectKey = objectKeyList[index]
+    let objectValue = object[objectKey]
 
     if (state.replacer) {
-      objectValue = state.replacer.call(object, objectKey, objectValue);
+      objectValue = state.replacer.call(object, objectKey, objectValue)
     }
 
     if (!writeNode(state, level + 1, objectKey, true, true, true)) {
-      continue; // Skip this pair because of invalid key.
+      continue // Skip this pair because of invalid key.
     }
 
-    explicitPair = (state.tag !== null && state.tag !== '?') ||
-                   (state.dump && state.dump.length > 1024);
+    const explicitPair = (state.tag !== null && state.tag !== '?') ||
+                   (state.dump && state.dump.length > 1024)
 
     if (explicitPair) {
       if (state.dump && CHAR_LINE_FEED === state.dump.charCodeAt(0)) {
-        pairBuffer += '?';
+        pairBuffer += '?'
       } else {
-        pairBuffer += '? ';
+        pairBuffer += '? '
       }
     }
 
-    pairBuffer += state.dump;
+    pairBuffer += state.dump
 
     if (explicitPair) {
-      pairBuffer += generateNextLine(state, level);
+      pairBuffer += generateNextLine(state, level)
     }
 
     if (!writeNode(state, level + 1, objectValue, true, explicitPair)) {
-      continue; // Skip this pair because of invalid value.
+      continue // Skip this pair because of invalid value.
     }
 
     if (state.dump && CHAR_LINE_FEED === state.dump.charCodeAt(0)) {
-      pairBuffer += ':';
+      pairBuffer += ':'
     } else {
-      pairBuffer += ': ';
+      pairBuffer += ': '
     }
 
-    pairBuffer += state.dump;
+    pairBuffer += state.dump
 
     // Both key and value are valid.
-    _result += pairBuffer;
+    _result += pairBuffer
   }
 
-  state.tag = _tag;
-  state.dump = _result || '{}'; // Empty mapping if no valid pairs.
+  state.tag = _tag
+  state.dump = _result || '{}' // Empty mapping if no valid pairs.
 }
 
-function detectType(state, object, explicit) {
-  var _result, typeList, index, length, type, style;
+function detectType (state, object, explicit) {
+  const typeList = explicit ? state.explicitTypes : state.implicitTypes
 
-  typeList = explicit ? state.explicitTypes : state.implicitTypes;
+  for (let index = 0, length = typeList.length; index < length; index += 1) {
+    const type = typeList[index]
 
-  for (index = 0, length = typeList.length; index < length; index += 1) {
-    type = typeList[index];
-
-    if ((type.instanceOf  || type.predicate) &&
+    if ((type.instanceOf || type.predicate) &&
         (!type.instanceOf || ((typeof object === 'object') && (object instanceof type.instanceOf))) &&
-        (!type.predicate  || type.predicate(object))) {
-
+        (!type.predicate || type.predicate(object))) {
       if (explicit) {
         if (type.multi && type.representName) {
-          state.tag = type.representName(object);
+          state.tag = type.representName(object)
         } else {
-          state.tag = type.tag;
+          state.tag = type.tag
         }
       } else {
-        state.tag = '?';
+        state.tag = '?'
       }
 
       if (type.represent) {
-        style = state.styleMap[type.tag] || type.defaultStyle;
+        const style = state.styleMap[type.tag] || type.defaultStyle
 
+        let _result
         if (_toString.call(type.represent) === '[object Function]') {
-          _result = type.represent(object, style);
+          _result = type.represent(object, style)
         } else if (_hasOwnProperty.call(type.represent, style)) {
-          _result = type.represent[style](object, style);
+          _result = type.represent[style](object, style)
         } else {
-          throw new YAMLException('!<' + type.tag + '> tag resolver accepts not "' + style + '" style');
+          throw new YAMLException('!<' + type.tag + '> tag resolver accepts not "' + style + '" style')
         }
 
-        state.dump = _result;
+        state.dump = _result
       }
 
-      return true;
+      return true
     }
   }
 
-  return false;
+  return false
 }
 
 // Serializes `object` and writes it to global `result`.
 // Returns true on success, or false on invalid object.
 //
-function writeNode(state, level, object, block, compact, iskey, isblockseq) {
-  state.tag = null;
-  state.dump = object;
+function writeNode (state, level, object, block, compact, iskey, isblockseq) {
+  state.tag = null
+  state.dump = object
 
   if (!detectType(state, object, false)) {
-    detectType(state, object, true);
+    detectType(state, object, true)
   }
 
-  var type = _toString.call(state.dump);
-  var inblock = block;
-  var tagStr;
+  const type = _toString.call(state.dump)
+  const inblock = block
 
   if (block) {
-    block = (state.flowLevel < 0 || state.flowLevel > level);
+    block = (state.flowLevel < 0 || state.flowLevel > level)
   }
 
-  var objectOrArray = type === '[object Object]' || type === '[object Array]',
-      duplicateIndex,
-      duplicate;
+  const objectOrArray = type === '[object Object]' || type === '[object Array]'
+  let duplicateIndex
+  let duplicate
 
   if (objectOrArray) {
-    duplicateIndex = state.duplicates.indexOf(object);
-    duplicate = duplicateIndex !== -1;
+    duplicateIndex = state.duplicates.indexOf(object)
+    duplicate = duplicateIndex !== -1
   }
 
   if ((state.tag !== null && state.tag !== '?') || duplicate || (state.indent !== 2 && level > 0)) {
-    compact = false;
+    compact = false
   }
 
   if (duplicate && state.usedDuplicates[duplicateIndex]) {
-    state.dump = '*ref_' + duplicateIndex;
+    state.dump = '*ref_' + duplicateIndex
   } else {
     if (objectOrArray && duplicate && !state.usedDuplicates[duplicateIndex]) {
-      state.usedDuplicates[duplicateIndex] = true;
+      state.usedDuplicates[duplicateIndex] = true
     }
     if (type === '[object Object]') {
       if (block && (Object.keys(state.dump).length !== 0)) {
-        writeBlockMapping(state, level, state.dump, compact);
+        writeBlockMapping(state, level, state.dump, compact)
         if (duplicate) {
-          state.dump = '&ref_' + duplicateIndex + state.dump;
+          state.dump = '&ref_' + duplicateIndex + state.dump
         }
       } else {
-        writeFlowMapping(state, level, state.dump);
+        writeFlowMapping(state, level, state.dump)
         if (duplicate) {
-          state.dump = '&ref_' + duplicateIndex + ' ' + state.dump;
+          state.dump = '&ref_' + duplicateIndex + ' ' + state.dump
         }
       }
     } else if (type === '[object Array]') {
       if (block && (state.dump.length !== 0)) {
         if (state.noArrayIndent && !isblockseq && level > 0) {
-          writeBlockSequence(state, level - 1, state.dump, compact);
+          writeBlockSequence(state, level - 1, state.dump, compact)
         } else {
-          writeBlockSequence(state, level, state.dump, compact);
+          writeBlockSequence(state, level, state.dump, compact)
         }
         if (duplicate) {
-          state.dump = '&ref_' + duplicateIndex + state.dump;
+          state.dump = '&ref_' + duplicateIndex + state.dump
         }
       } else {
-        writeFlowSequence(state, level, state.dump);
+        writeFlowSequence(state, level, state.dump)
         if (duplicate) {
-          state.dump = '&ref_' + duplicateIndex + ' ' + state.dump;
+          state.dump = '&ref_' + duplicateIndex + ' ' + state.dump
         }
       }
     } else if (type === '[object String]') {
       if (state.tag !== '?') {
-        writeScalar(state, state.dump, level, iskey, inblock);
+        writeScalar(state, state.dump, level, iskey, inblock)
       }
     } else if (type === '[object Undefined]') {
-      return false;
+      return false
     } else {
-      if (state.skipInvalid) return false;
-      throw new YAMLException('unacceptable kind of an object to dump ' + type);
+      if (state.skipInvalid) return false
+      throw new YAMLException('unacceptable kind of an object to dump ' + type)
     }
 
     if (state.tag !== null && state.tag !== '?') {
@@ -34819,87 +33186,82 @@ function writeNode(state, level, object, block, compact, iskey, isblockseq) {
       //
       // Also need to encode '!' because it has special meaning (end of tag prefix).
       //
-      tagStr = encodeURI(
+      let tagStr = encodeURI(
         state.tag[0] === '!' ? state.tag.slice(1) : state.tag
-      ).replace(/!/g, '%21');
+      ).replace(/!/g, '%21')
 
       if (state.tag[0] === '!') {
-        tagStr = '!' + tagStr;
+        tagStr = '!' + tagStr
       } else if (tagStr.slice(0, 18) === 'tag:yaml.org,2002:') {
-        tagStr = '!!' + tagStr.slice(18);
+        tagStr = '!!' + tagStr.slice(18)
       } else {
-        tagStr = '!<' + tagStr + '>';
+        tagStr = '!<' + tagStr + '>'
       }
 
-      state.dump = tagStr + ' ' + state.dump;
+      state.dump = tagStr + ' ' + state.dump
     }
   }
 
-  return true;
+  return true
 }
 
-function getDuplicateReferences(object, state) {
-  var objects = [],
-      duplicatesIndexes = [],
-      index,
-      length;
+function getDuplicateReferences (object, state) {
+  const objects = []
+  const duplicatesIndexes = []
 
-  inspectNode(object, objects, duplicatesIndexes);
+  inspectNode(object, objects, duplicatesIndexes)
 
-  for (index = 0, length = duplicatesIndexes.length; index < length; index += 1) {
-    state.duplicates.push(objects[duplicatesIndexes[index]]);
+  const length = duplicatesIndexes.length
+  for (let index = 0; index < length; index += 1) {
+    state.duplicates.push(objects[duplicatesIndexes[index]])
   }
-  state.usedDuplicates = new Array(length);
+  state.usedDuplicates = new Array(length)
 }
 
-function inspectNode(object, objects, duplicatesIndexes) {
-  var objectKeyList,
-      index,
-      length;
-
+function inspectNode (object, objects, duplicatesIndexes) {
   if (object !== null && typeof object === 'object') {
-    index = objects.indexOf(object);
+    const index = objects.indexOf(object)
     if (index !== -1) {
       if (duplicatesIndexes.indexOf(index) === -1) {
-        duplicatesIndexes.push(index);
+        duplicatesIndexes.push(index)
       }
     } else {
-      objects.push(object);
+      objects.push(object)
 
       if (Array.isArray(object)) {
-        for (index = 0, length = object.length; index < length; index += 1) {
-          inspectNode(object[index], objects, duplicatesIndexes);
+        for (let i = 0, length = object.length; i < length; i += 1) {
+          inspectNode(object[i], objects, duplicatesIndexes)
         }
       } else {
-        objectKeyList = Object.keys(object);
+        const objectKeyList = Object.keys(object)
 
-        for (index = 0, length = objectKeyList.length; index < length; index += 1) {
-          inspectNode(object[objectKeyList[index]], objects, duplicatesIndexes);
+        for (let i = 0, length = objectKeyList.length; i < length; i += 1) {
+          inspectNode(object[objectKeyList[i]], objects, duplicatesIndexes)
         }
       }
     }
   }
 }
 
-function dump(input, options) {
-  options = options || {};
+function dump (input, options) {
+  options = options || {}
 
-  var state = new State(options);
+  const state = new State(options)
 
-  if (!state.noRefs) getDuplicateReferences(input, state);
+  if (!state.noRefs) getDuplicateReferences(input, state)
 
-  var value = input;
+  let value = input
 
   if (state.replacer) {
-    value = state.replacer.call({ '': value }, '', value);
+    value = state.replacer.call({ '': value }, '', value)
   }
 
-  if (writeNode(state, 0, value, true, true)) return state.dump + '\n';
+  if (writeNode(state, 0, value, true, true)) return state.dump + '\n'
 
-  return '';
+  return ''
 }
 
-module.exports.dump = dump;
+module.exports.dump = dump
 
 
 /***/ }),
@@ -34912,57 +33274,53 @@ module.exports.dump = dump;
 //
 
 
+function formatError (exception, compact) {
+  let where = ''
+  const message = exception.reason || '(unknown reason)'
 
-function formatError(exception, compact) {
-  var where = '', message = exception.reason || '(unknown reason)';
-
-  if (!exception.mark) return message;
+  if (!exception.mark) return message
 
   if (exception.mark.name) {
-    where += 'in "' + exception.mark.name + '" ';
+    where += 'in "' + exception.mark.name + '" '
   }
 
-  where += '(' + (exception.mark.line + 1) + ':' + (exception.mark.column + 1) + ')';
+  where += '(' + (exception.mark.line + 1) + ':' + (exception.mark.column + 1) + ')'
 
   if (!compact && exception.mark.snippet) {
-    where += '\n\n' + exception.mark.snippet;
+    where += '\n\n' + exception.mark.snippet
   }
 
-  return message + ' ' + where;
+  return message + ' ' + where
 }
 
-
-function YAMLException(reason, mark) {
+function YAMLException (reason, mark) {
   // Super constructor
-  Error.call(this);
+  Error.call(this)
 
-  this.name = 'YAMLException';
-  this.reason = reason;
-  this.mark = mark;
-  this.message = formatError(this, false);
+  this.name = 'YAMLException'
+  this.reason = reason
+  this.mark = mark
+  this.message = formatError(this, false)
 
   // Include stack trace in error object
   if (Error.captureStackTrace) {
     // Chrome and NodeJS
-    Error.captureStackTrace(this, this.constructor);
+    Error.captureStackTrace(this, this.constructor)
   } else {
     // FF, IE 10+ and Safari 6+. Fallback for others
-    this.stack = (new Error()).stack || '';
+    this.stack = (new Error()).stack || ''
   }
 }
 
-
 // Inherit from Error
-YAMLException.prototype = Object.create(Error.prototype);
-YAMLException.prototype.constructor = YAMLException;
+YAMLException.prototype = Object.create(Error.prototype)
+YAMLException.prototype.constructor = YAMLException
 
+YAMLException.prototype.toString = function toString (compact) {
+  return this.name + ': ' + formatError(this, compact)
+}
 
-YAMLException.prototype.toString = function toString(compact) {
-  return this.name + ': ' + formatError(this, compact);
-};
-
-
-module.exports = YAMLException;
+module.exports = YAMLException
 
 
 /***/ }),
@@ -34973,129 +33331,125 @@ module.exports = YAMLException;
 "use strict";
 
 
-/*eslint-disable max-len,no-use-before-define*/
+const common = __nccwpck_require__(19816)
+const YAMLException = __nccwpck_require__(41248)
+const makeSnippet = __nccwpck_require__(9440)
+const DEFAULT_SCHEMA = __nccwpck_require__(97336)
 
-var common              = __nccwpck_require__(19816);
-var YAMLException       = __nccwpck_require__(41248);
-var makeSnippet         = __nccwpck_require__(9440);
-var DEFAULT_SCHEMA      = __nccwpck_require__(97336);
+const _hasOwnProperty = Object.prototype.hasOwnProperty
 
+const CONTEXT_FLOW_IN = 1
+const CONTEXT_FLOW_OUT = 2
+const CONTEXT_BLOCK_IN = 3
+const CONTEXT_BLOCK_OUT = 4
 
-var _hasOwnProperty = Object.prototype.hasOwnProperty;
+const CHOMPING_CLIP = 1
+const CHOMPING_STRIP = 2
+const CHOMPING_KEEP = 3
 
+// eslint-disable-next-line no-control-regex
+const PATTERN_NON_PRINTABLE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/
+const PATTERN_NON_ASCII_LINE_BREAKS = /[\x85\u2028\u2029]/
+// eslint-disable-next-line no-useless-escape
+const PATTERN_FLOW_INDICATORS = /[,\[\]{}]/
+// eslint-disable-next-line no-useless-escape
+const PATTERN_TAG_HANDLE = /^(?:!|!!|![0-9A-Za-z-]+!)$/
+// eslint-disable-next-line no-useless-escape
+const PATTERN_TAG_URI = /^(?:!|[^,\[\]{}])(?:%[0-9a-f]{2}|[0-9a-z\-#;/?:@&=+$,_.!~*'()\[\]])*$/i
 
-var CONTEXT_FLOW_IN   = 1;
-var CONTEXT_FLOW_OUT  = 2;
-var CONTEXT_BLOCK_IN  = 3;
-var CONTEXT_BLOCK_OUT = 4;
+function _class (obj) { return Object.prototype.toString.call(obj) }
 
-
-var CHOMPING_CLIP  = 1;
-var CHOMPING_STRIP = 2;
-var CHOMPING_KEEP  = 3;
-
-
-var PATTERN_NON_PRINTABLE         = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/;
-var PATTERN_NON_ASCII_LINE_BREAKS = /[\x85\u2028\u2029]/;
-var PATTERN_FLOW_INDICATORS       = /[,\[\]\{\}]/;
-var PATTERN_TAG_HANDLE            = /^(?:!|!!|![a-z\-]+!)$/i;
-var PATTERN_TAG_URI               = /^(?:!|[^,\[\]\{\}])(?:%[0-9a-f]{2}|[0-9a-z\-#;\/\?:@&=\+\$,_\.!~\*'\(\)\[\]])*$/i;
-
-
-function _class(obj) { return Object.prototype.toString.call(obj); }
-
-function is_EOL(c) {
-  return (c === 0x0A/* LF */) || (c === 0x0D/* CR */);
+function isEol (c) {
+  return (c === 0x0A/* LF */) || (c === 0x0D/* CR */)
 }
 
-function is_WHITE_SPACE(c) {
-  return (c === 0x09/* Tab */) || (c === 0x20/* Space */);
+function isWhiteSpace (c) {
+  return (c === 0x09/* Tab */) || (c === 0x20/* Space */)
 }
 
-function is_WS_OR_EOL(c) {
+function isWsOrEol (c) {
   return (c === 0x09/* Tab */) ||
          (c === 0x20/* Space */) ||
          (c === 0x0A/* LF */) ||
-         (c === 0x0D/* CR */);
+         (c === 0x0D/* CR */)
 }
 
-function is_FLOW_INDICATOR(c) {
+function isFlowIndicator (c) {
   return c === 0x2C/* , */ ||
          c === 0x5B/* [ */ ||
          c === 0x5D/* ] */ ||
          c === 0x7B/* { */ ||
-         c === 0x7D/* } */;
+         c === 0x7D/* } */
 }
 
-function fromHexCode(c) {
-  var lc;
-
-  if ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */)) {
-    return c - 0x30;
+function fromHexCode (c) {
+  if ((c >= 0x30/* 0 */) && (c <= 0x39/* 9 */)) {
+    return c - 0x30
   }
 
-  /*eslint-disable no-bitwise*/
-  lc = c | 0x20;
+  const lc = c | 0x20
 
-  if ((0x61/* a */ <= lc) && (lc <= 0x66/* f */)) {
-    return lc - 0x61 + 10;
+  if ((lc >= 0x61/* a */) && (lc <= 0x66/* f */)) {
+    return lc - 0x61 + 10
   }
 
-  return -1;
+  return -1
 }
 
-function escapedHexLen(c) {
-  if (c === 0x78/* x */) { return 2; }
-  if (c === 0x75/* u */) { return 4; }
-  if (c === 0x55/* U */) { return 8; }
-  return 0;
+function escapedHexLen (c) {
+  if (c === 0x78/* x */) { return 2 }
+  if (c === 0x75/* u */) { return 4 }
+  if (c === 0x55/* U */) { return 8 }
+  return 0
 }
 
-function fromDecimalCode(c) {
-  if ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */)) {
-    return c - 0x30;
+function fromDecimalCode (c) {
+  if ((c >= 0x30/* 0 */) && (c <= 0x39/* 9 */)) {
+    return c - 0x30
   }
 
-  return -1;
+  return -1
 }
 
-function simpleEscapeSequence(c) {
-  /* eslint-disable indent */
-  return (c === 0x30/* 0 */) ? '\x00' :
-        (c === 0x61/* a */) ? '\x07' :
-        (c === 0x62/* b */) ? '\x08' :
-        (c === 0x74/* t */) ? '\x09' :
-        (c === 0x09/* Tab */) ? '\x09' :
-        (c === 0x6E/* n */) ? '\x0A' :
-        (c === 0x76/* v */) ? '\x0B' :
-        (c === 0x66/* f */) ? '\x0C' :
-        (c === 0x72/* r */) ? '\x0D' :
-        (c === 0x65/* e */) ? '\x1B' :
-        (c === 0x20/* Space */) ? ' ' :
-        (c === 0x22/* " */) ? '\x22' :
-        (c === 0x2F/* / */) ? '/' :
-        (c === 0x5C/* \ */) ? '\x5C' :
-        (c === 0x4E/* N */) ? '\x85' :
-        (c === 0x5F/* _ */) ? '\xA0' :
-        (c === 0x4C/* L */) ? '\u2028' :
-        (c === 0x50/* P */) ? '\u2029' : '';
+function simpleEscapeSequence (c) {
+  switch (c) {
+    case 0x30/* 0 */: return '\x00'
+    case 0x61/* a */: return '\x07'
+    case 0x62/* b */: return '\x08'
+    case 0x74/* t */: return '\x09'
+    case 0x09/* Tab */: return '\x09'
+    case 0x6E/* n */: return '\x0A'
+    case 0x76/* v */: return '\x0B'
+    case 0x66/* f */: return '\x0C'
+    case 0x72/* r */: return '\x0D'
+    case 0x65/* e */: return '\x1B'
+    case 0x20/* Space */: return ' '
+    case 0x22/* " */: return '\x22'
+    case 0x2F/* / */: return '/'
+    case 0x5C/* \ */: return '\x5C'
+    case 0x4E/* N */: return '\x85'
+    case 0x5F/* _ */: return '\xA0'
+    case 0x4C/* L */: return '\u2028'
+    case 0x50/* P */: return '\u2029'
+    default: return ''
+  }
 }
 
-function charFromCodepoint(c) {
+function charFromCodepoint (c) {
   if (c <= 0xFFFF) {
-    return String.fromCharCode(c);
+    return String.fromCharCode(c)
   }
   // Encode UTF-16 surrogate pair
   // https://en.wikipedia.org/wiki/UTF-16#Code_points_U.2B010000_to_U.2B10FFFF
   return String.fromCharCode(
     ((c - 0x010000) >> 10) + 0xD800,
     ((c - 0x010000) & 0x03FF) + 0xDC00
-  );
+  )
 }
 
 // set a property of a literal object, while protecting against prototype pollution,
 // see https://github.com/nodeca/js-yaml/issues/164 for more details
-function setProperty(object, key, value) {
+function setProperty (object, key, value) {
   // used for this specific key only because Object.defineProperty is slow
   if (key === '__proto__') {
     Object.defineProperty(object, key, {
@@ -35103,47 +33457,51 @@ function setProperty(object, key, value) {
       enumerable: true,
       writable: true,
       value: value
-    });
+    })
   } else {
-    object[key] = value;
+    object[key] = value
   }
 }
 
-var simpleEscapeCheck = new Array(256); // integer, for fast access
-var simpleEscapeMap = new Array(256);
-for (var i = 0; i < 256; i++) {
-  simpleEscapeCheck[i] = simpleEscapeSequence(i) ? 1 : 0;
-  simpleEscapeMap[i] = simpleEscapeSequence(i);
+const simpleEscapeCheck = new Array(256) // integer, for fast access
+const simpleEscapeMap = new Array(256)
+for (let i = 0; i < 256; i++) {
+  simpleEscapeCheck[i] = simpleEscapeSequence(i) ? 1 : 0
+  simpleEscapeMap[i] = simpleEscapeSequence(i)
 }
 
+function State (input, options) {
+  this.input = input
 
-function State(input, options) {
-  this.input = input;
-
-  this.filename  = options['filename']  || null;
-  this.schema    = options['schema']    || DEFAULT_SCHEMA;
-  this.onWarning = options['onWarning'] || null;
+  this.filename = options['filename'] || null
+  this.schema = options['schema'] || DEFAULT_SCHEMA
+  this.onWarning = options['onWarning'] || null
   // (Hidden) Remove? makes the loader to expect YAML 1.1 documents
   // if such documents have no explicit %YAML directive
-  this.legacy    = options['legacy']    || false;
+  this.legacy = options['legacy'] || false
 
-  this.json      = options['json']      || false;
-  this.listener  = options['listener']  || null;
+  this.json = options['json'] || false
+  this.listener = options['listener'] || null
+  this.maxDepth = typeof options['maxDepth'] === 'number' ? options['maxDepth'] : 100
+  this.maxTotalMergeKeys = typeof options['maxTotalMergeKeys'] === 'number' ? options['maxTotalMergeKeys'] : 10000
 
-  this.implicitTypes = this.schema.compiledImplicit;
-  this.typeMap       = this.schema.compiledTypeMap;
+  this.implicitTypes = this.schema.compiledImplicit
+  this.typeMap = this.schema.compiledTypeMap
 
-  this.length     = input.length;
-  this.position   = 0;
-  this.line       = 0;
-  this.lineStart  = 0;
-  this.lineIndent = 0;
+  this.length = input.length
+  this.position = 0
+  this.line = 0
+  this.lineStart = 0
+  this.lineIndent = 0
+  this.depth = 0
+  this.totalMergeKeys = 0
 
   // position of first leading tab in the current line,
   // used to make sure there are no tabs in the indentation
-  this.firstTabInLine = -1;
+  this.firstTabInLine = -1
 
-  this.documents = [];
+  this.documents = []
+  this.anchorMapTransactions = []
 
   /*
   this.version;
@@ -35153,164 +33511,242 @@ function State(input, options) {
   this.tag;
   this.anchor;
   this.kind;
-  this.result;*/
-
+  this.result; */
 }
 
-
-function generateError(state, message) {
-  var mark = {
-    name:     state.filename,
-    buffer:   state.input.slice(0, -1), // omit trailing \0
+function generateError (state, message) {
+  const mark = {
+    name: state.filename,
+    buffer: state.input.slice(0, -1), // omit trailing \0
     position: state.position,
-    line:     state.line,
-    column:   state.position - state.lineStart
-  };
+    line: state.line,
+    column: state.position - state.lineStart
+  }
 
-  mark.snippet = makeSnippet(mark);
+  mark.snippet = makeSnippet(mark)
 
-  return new YAMLException(message, mark);
+  return new YAMLException(message, mark)
 }
 
-function throwError(state, message) {
-  throw generateError(state, message);
+function throwError (state, message) {
+  throw generateError(state, message)
 }
 
-function throwWarning(state, message) {
+function throwWarning (state, message) {
   if (state.onWarning) {
-    state.onWarning.call(null, generateError(state, message));
+    state.onWarning.call(null, generateError(state, message))
   }
 }
 
+function storeAnchor (state, name, value) {
+  const transactions = state.anchorMapTransactions
 
-var directiveHandlers = {
+  if (transactions.length !== 0) {
+    const transaction = transactions[transactions.length - 1]
 
-  YAML: function handleYamlDirective(state, name, args) {
+    if (!_hasOwnProperty.call(transaction, name)) {
+      transaction[name] = {
+        existed: _hasOwnProperty.call(state.anchorMap, name),
+        value: state.anchorMap[name]
+      }
+    }
+  }
 
-    var match, major, minor;
+  state.anchorMap[name] = value
+}
 
+function beginAnchorTransaction (state) {
+  state.anchorMapTransactions.push(Object.create(null))
+}
+
+function commitAnchorTransaction (state) {
+  const transaction = state.anchorMapTransactions.pop()
+  const transactions = state.anchorMapTransactions
+
+  if (transactions.length === 0) return
+
+  const parent = transactions[transactions.length - 1]
+  const names = Object.keys(transaction)
+
+  for (let index = 0, length = names.length; index < length; index += 1) {
+    const name = names[index]
+
+    if (!_hasOwnProperty.call(parent, name)) {
+      parent[name] = transaction[name]
+    }
+  }
+}
+
+function rollbackAnchorTransaction (state) {
+  const transaction = state.anchorMapTransactions.pop()
+  const names = Object.keys(transaction)
+
+  for (let index = names.length - 1; index >= 0; index -= 1) {
+    const entry = transaction[names[index]]
+
+    if (entry.existed) {
+      state.anchorMap[names[index]] = entry.value
+    } else {
+      delete state.anchorMap[names[index]]
+    }
+  }
+}
+
+function snapshotState (state) {
+  return {
+    position: state.position,
+    line: state.line,
+    lineStart: state.lineStart,
+    lineIndent: state.lineIndent,
+    firstTabInLine: state.firstTabInLine,
+    tag: state.tag,
+    anchor: state.anchor,
+    kind: state.kind,
+    result: state.result
+  }
+}
+
+function restoreState (state, snapshot) {
+  state.position = snapshot.position
+  state.line = snapshot.line
+  state.lineStart = snapshot.lineStart
+  state.lineIndent = snapshot.lineIndent
+  state.firstTabInLine = snapshot.firstTabInLine
+  state.tag = snapshot.tag
+  state.anchor = snapshot.anchor
+  state.kind = snapshot.kind
+  state.result = snapshot.result
+}
+
+const directiveHandlers = {
+
+  YAML: function handleYamlDirective (state, name, args) {
     if (state.version !== null) {
-      throwError(state, 'duplication of %YAML directive');
+      throwError(state, 'duplication of %YAML directive')
     }
 
     if (args.length !== 1) {
-      throwError(state, 'YAML directive accepts exactly one argument');
+      throwError(state, 'YAML directive accepts exactly one argument')
     }
 
-    match = /^([0-9]+)\.([0-9]+)$/.exec(args[0]);
+    const match = /^([0-9]+)\.([0-9]+)$/.exec(args[0])
 
     if (match === null) {
-      throwError(state, 'ill-formed argument of the YAML directive');
+      throwError(state, 'ill-formed argument of the YAML directive')
     }
 
-    major = parseInt(match[1], 10);
-    minor = parseInt(match[2], 10);
+    const major = parseInt(match[1], 10)
+    const minor = parseInt(match[2], 10)
 
     if (major !== 1) {
-      throwError(state, 'unacceptable YAML version of the document');
+      throwError(state, 'unacceptable YAML version of the document')
     }
 
-    state.version = args[0];
-    state.checkLineBreaks = (minor < 2);
+    state.version = args[0]
+    state.checkLineBreaks = (minor < 2)
 
     if (minor !== 1 && minor !== 2) {
-      throwWarning(state, 'unsupported YAML version of the document');
+      throwWarning(state, 'unsupported YAML version of the document')
     }
   },
 
-  TAG: function handleTagDirective(state, name, args) {
-
-    var handle, prefix;
+  TAG: function handleTagDirective (state, name, args) {
+    let prefix
 
     if (args.length !== 2) {
-      throwError(state, 'TAG directive accepts exactly two arguments');
+      throwError(state, 'TAG directive accepts exactly two arguments')
     }
 
-    handle = args[0];
-    prefix = args[1];
+    const handle = args[0]
+    prefix = args[1]
 
     if (!PATTERN_TAG_HANDLE.test(handle)) {
-      throwError(state, 'ill-formed tag handle (first argument) of the TAG directive');
+      throwError(state, 'ill-formed tag handle (first argument) of the TAG directive')
     }
 
     if (_hasOwnProperty.call(state.tagMap, handle)) {
-      throwError(state, 'there is a previously declared suffix for "' + handle + '" tag handle');
+      throwError(state, 'there is a previously declared suffix for "' + handle + '" tag handle')
     }
 
     if (!PATTERN_TAG_URI.test(prefix)) {
-      throwError(state, 'ill-formed tag prefix (second argument) of the TAG directive');
+      throwError(state, 'ill-formed tag prefix (second argument) of the TAG directive')
     }
 
     try {
-      prefix = decodeURIComponent(prefix);
+      prefix = decodeURIComponent(prefix)
     } catch (err) {
-      throwError(state, 'tag prefix is malformed: ' + prefix);
+      throwError(state, 'tag prefix is malformed: ' + prefix)
     }
 
-    state.tagMap[handle] = prefix;
+    state.tagMap[handle] = prefix
   }
-};
+}
 
-
-function captureSegment(state, start, end, checkJson) {
-  var _position, _length, _character, _result;
-
+function captureSegment (state, start, end, checkJson) {
   if (start < end) {
-    _result = state.input.slice(start, end);
+    const _result = state.input.slice(start, end)
 
     if (checkJson) {
-      for (_position = 0, _length = _result.length; _position < _length; _position += 1) {
-        _character = _result.charCodeAt(_position);
+      for (let _position = 0, _length = _result.length; _position < _length; _position += 1) {
+        const _character = _result.charCodeAt(_position)
         if (!(_character === 0x09 ||
-              (0x20 <= _character && _character <= 0x10FFFF))) {
-          throwError(state, 'expected valid JSON character');
+              (_character >= 0x20 && _character <= 0x10FFFF))) {
+          throwError(state, 'expected valid JSON character')
         }
       }
     } else if (PATTERN_NON_PRINTABLE.test(_result)) {
-      throwError(state, 'the stream contains non-printable characters');
+      throwError(state, 'the stream contains non-printable characters')
     }
 
-    state.result += _result;
+    state.result += _result
   }
 }
 
-function mergeMappings(state, destination, source, overridableKeys) {
-  var sourceKeys, key, index, quantity;
+function chargeMergeWork (state) {
+  state.totalMergeKeys++
 
+  if (state.maxTotalMergeKeys !== -1 && state.totalMergeKeys > state.maxTotalMergeKeys) {
+    throwError(state, 'merge keys exceeded maxTotalMergeKeys (' + state.maxTotalMergeKeys + ')')
+  }
+}
+
+function mergeMappings (state, destination, source, overridableKeys) {
   if (!common.isObject(source)) {
-    throwError(state, 'cannot merge mappings; the provided source object is unacceptable');
+    throwError(state, 'cannot merge mappings; the provided source object is unacceptable')
   }
 
-  sourceKeys = Object.keys(source);
+  // Count the source mapping itself to bound sequences of empty mappings.
+  chargeMergeWork(state)
 
-  for (index = 0, quantity = sourceKeys.length; index < quantity; index += 1) {
-    key = sourceKeys[index];
+  const sourceKeys = Object.keys(source)
+
+  for (let index = 0, quantity = sourceKeys.length; index < quantity; index += 1) {
+    const key = sourceKeys[index]
+
+    chargeMergeWork(state)
 
     if (!_hasOwnProperty.call(destination, key)) {
-      setProperty(destination, key, source[key]);
-      overridableKeys[key] = true;
+      setProperty(destination, key, source[key])
+      overridableKeys[key] = true
     }
   }
 }
 
-function storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode,
+function storeMappingPair (state, _result, overridableKeys, keyTag, keyNode, valueNode,
   startLine, startLineStart, startPos) {
-
-  var index, quantity;
-
   // The output is a plain object here, so keys can only be strings.
   // We need to convert keyNode to a string, but doing so can hang the process
   // (deeply nested arrays that explode exponentially using aliases).
   if (Array.isArray(keyNode)) {
-    keyNode = Array.prototype.slice.call(keyNode);
+    keyNode = Array.prototype.slice.call(keyNode)
 
-    for (index = 0, quantity = keyNode.length; index < quantity; index += 1) {
+    for (let index = 0, quantity = keyNode.length; index < quantity; index += 1) {
       if (Array.isArray(keyNode[index])) {
-        throwError(state, 'nested arrays are not supported inside keys');
+        throwError(state, 'nested arrays are not supported inside keys')
       }
 
       if (typeof keyNode === 'object' && _class(keyNode[index]) === '[object Object]') {
-        keyNode[index] = '[object Object]';
+        keyNode[index] = '[object Object]'
       }
     }
   }
@@ -35319,814 +33755,780 @@ function storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valu
   // (still use its own toString for arrays, timestamps,
   // and whatever user schema extensions happen to have @@toStringTag)
   if (typeof keyNode === 'object' && _class(keyNode) === '[object Object]') {
-    keyNode = '[object Object]';
+    keyNode = '[object Object]'
   }
 
-
-  keyNode = String(keyNode);
+  keyNode = String(keyNode)
 
   if (_result === null) {
-    _result = {};
+    _result = {}
   }
 
   if (keyTag === 'tag:yaml.org,2002:merge') {
     if (Array.isArray(valueNode)) {
-      for (index = 0, quantity = valueNode.length; index < quantity; index += 1) {
-        mergeMappings(state, _result, valueNode[index], overridableKeys);
+      if (valueNode.length > 100) {
+        throwError(state, 'abnormal merge sequence size')
+      }
+
+      for (let index = 0, quantity = valueNode.length; index < quantity; index += 1) {
+        mergeMappings(state, _result, valueNode[index], overridableKeys)
       }
     } else {
-      mergeMappings(state, _result, valueNode, overridableKeys);
+      mergeMappings(state, _result, valueNode, overridableKeys)
     }
   } else {
     if (!state.json &&
         !_hasOwnProperty.call(overridableKeys, keyNode) &&
         _hasOwnProperty.call(_result, keyNode)) {
-      state.line = startLine || state.line;
-      state.lineStart = startLineStart || state.lineStart;
-      state.position = startPos || state.position;
-      throwError(state, 'duplicated mapping key');
+      state.line = startLine || state.line
+      state.lineStart = startLineStart || state.lineStart
+      state.position = startPos || state.position
+      throwError(state, 'duplicated mapping key')
     }
 
-    setProperty(_result, keyNode, valueNode);
-    delete overridableKeys[keyNode];
+    setProperty(_result, keyNode, valueNode)
+    delete overridableKeys[keyNode]
   }
 
-  return _result;
+  return _result
 }
 
-function readLineBreak(state) {
-  var ch;
-
-  ch = state.input.charCodeAt(state.position);
+function readLineBreak (state) {
+  const ch = state.input.charCodeAt(state.position)
 
   if (ch === 0x0A/* LF */) {
-    state.position++;
+    state.position++
   } else if (ch === 0x0D/* CR */) {
-    state.position++;
+    state.position++
     if (state.input.charCodeAt(state.position) === 0x0A/* LF */) {
-      state.position++;
+      state.position++
     }
   } else {
-    throwError(state, 'a line break is expected');
+    throwError(state, 'a line break is expected')
   }
 
-  state.line += 1;
-  state.lineStart = state.position;
-  state.firstTabInLine = -1;
+  state.line += 1
+  state.lineStart = state.position
+  state.firstTabInLine = -1
 }
 
-function skipSeparationSpace(state, allowComments, checkIndent) {
-  var lineBreaks = 0,
-      ch = state.input.charCodeAt(state.position);
+function skipSeparationSpace (state, allowComments, checkIndent) {
+  let lineBreaks = 0
+  let ch = state.input.charCodeAt(state.position)
 
   while (ch !== 0) {
-    while (is_WHITE_SPACE(ch)) {
+    while (isWhiteSpace(ch)) {
       if (ch === 0x09/* Tab */ && state.firstTabInLine === -1) {
-        state.firstTabInLine = state.position;
+        state.firstTabInLine = state.position
       }
-      ch = state.input.charCodeAt(++state.position);
+      ch = state.input.charCodeAt(++state.position)
     }
 
     if (allowComments && ch === 0x23/* # */) {
       do {
-        ch = state.input.charCodeAt(++state.position);
-      } while (ch !== 0x0A/* LF */ && ch !== 0x0D/* CR */ && ch !== 0);
+        ch = state.input.charCodeAt(++state.position)
+      } while (ch !== 0x0A/* LF */ && ch !== 0x0D/* CR */ && ch !== 0)
     }
 
-    if (is_EOL(ch)) {
-      readLineBreak(state);
+    if (isEol(ch)) {
+      readLineBreak(state)
 
-      ch = state.input.charCodeAt(state.position);
-      lineBreaks++;
-      state.lineIndent = 0;
+      ch = state.input.charCodeAt(state.position)
+      lineBreaks++
+      state.lineIndent = 0
 
       while (ch === 0x20/* Space */) {
-        state.lineIndent++;
-        ch = state.input.charCodeAt(++state.position);
+        state.lineIndent++
+        ch = state.input.charCodeAt(++state.position)
       }
     } else {
-      break;
+      break
     }
   }
 
   if (checkIndent !== -1 && lineBreaks !== 0 && state.lineIndent < checkIndent) {
-    throwWarning(state, 'deficient indentation');
+    throwWarning(state, 'deficient indentation')
   }
 
-  return lineBreaks;
+  return lineBreaks
 }
 
-function testDocumentSeparator(state) {
-  var _position = state.position,
-      ch;
-
-  ch = state.input.charCodeAt(_position);
+function testDocumentSeparator (state) {
+  let _position = state.position
+  let ch = state.input.charCodeAt(_position)
 
   // Condition state.position === state.lineStart is tested
   // in parent on each call, for efficiency. No needs to test here again.
   if ((ch === 0x2D/* - */ || ch === 0x2E/* . */) &&
       ch === state.input.charCodeAt(_position + 1) &&
       ch === state.input.charCodeAt(_position + 2)) {
+    _position += 3
 
-    _position += 3;
+    ch = state.input.charCodeAt(_position)
 
-    ch = state.input.charCodeAt(_position);
-
-    if (ch === 0 || is_WS_OR_EOL(ch)) {
-      return true;
+    if (ch === 0 || isWsOrEol(ch)) {
+      return true
     }
   }
 
-  return false;
+  return false
 }
 
-function writeFoldedLines(state, count) {
+function writeFoldedLines (state, count) {
   if (count === 1) {
-    state.result += ' ';
+    state.result += ' '
   } else if (count > 1) {
-    state.result += common.repeat('\n', count - 1);
+    state.result += common.repeat('\n', count - 1)
   }
 }
 
+function readPlainScalar (state, nodeIndent, withinFlowCollection) {
+  let captureStart
+  let captureEnd
+  let hasPendingContent
+  let _line
+  let _lineStart
+  let _lineIndent
+  const _kind = state.kind
+  const _result = state.result
 
-function readPlainScalar(state, nodeIndent, withinFlowCollection) {
-  var preceding,
-      following,
-      captureStart,
-      captureEnd,
-      hasPendingContent,
-      _line,
-      _lineStart,
-      _lineIndent,
-      _kind = state.kind,
-      _result = state.result,
-      ch;
+  let ch = state.input.charCodeAt(state.position)
 
-  ch = state.input.charCodeAt(state.position);
-
-  if (is_WS_OR_EOL(ch)      ||
-      is_FLOW_INDICATOR(ch) ||
-      ch === 0x23/* # */    ||
-      ch === 0x26/* & */    ||
-      ch === 0x2A/* * */    ||
-      ch === 0x21/* ! */    ||
-      ch === 0x7C/* | */    ||
-      ch === 0x3E/* > */    ||
-      ch === 0x27/* ' */    ||
-      ch === 0x22/* " */    ||
-      ch === 0x25/* % */    ||
-      ch === 0x40/* @ */    ||
+  if (isWsOrEol(ch) ||
+      isFlowIndicator(ch) ||
+      ch === 0x23/* # */ ||
+      ch === 0x26/* & */ ||
+      ch === 0x2A/* * */ ||
+      ch === 0x21/* ! */ ||
+      ch === 0x7C/* | */ ||
+      ch === 0x3E/* > */ ||
+      ch === 0x27/* ' */ ||
+      ch === 0x22/* " */ ||
+      ch === 0x25/* % */ ||
+      ch === 0x40/* @ */ ||
       ch === 0x60/* ` */) {
-    return false;
+    return false
   }
 
   if (ch === 0x3F/* ? */ || ch === 0x2D/* - */) {
-    following = state.input.charCodeAt(state.position + 1);
+    const following = state.input.charCodeAt(state.position + 1)
 
-    if (is_WS_OR_EOL(following) ||
-        withinFlowCollection && is_FLOW_INDICATOR(following)) {
-      return false;
+    if (isWsOrEol(following) ||
+        (withinFlowCollection && isFlowIndicator(following))) {
+      return false
     }
   }
 
-  state.kind = 'scalar';
-  state.result = '';
-  captureStart = captureEnd = state.position;
-  hasPendingContent = false;
+  state.kind = 'scalar'
+  state.result = ''
+  captureStart = captureEnd = state.position
+  hasPendingContent = false
 
   while (ch !== 0) {
     if (ch === 0x3A/* : */) {
-      following = state.input.charCodeAt(state.position + 1);
+      const following = state.input.charCodeAt(state.position + 1)
 
-      if (is_WS_OR_EOL(following) ||
-          withinFlowCollection && is_FLOW_INDICATOR(following)) {
-        break;
+      if (isWsOrEol(following) ||
+          (withinFlowCollection && isFlowIndicator(following))) {
+        break
       }
-
     } else if (ch === 0x23/* # */) {
-      preceding = state.input.charCodeAt(state.position - 1);
+      const preceding = state.input.charCodeAt(state.position - 1)
 
-      if (is_WS_OR_EOL(preceding)) {
-        break;
+      if (isWsOrEol(preceding)) {
+        break
       }
-
     } else if ((state.position === state.lineStart && testDocumentSeparator(state)) ||
-               withinFlowCollection && is_FLOW_INDICATOR(ch)) {
-      break;
-
-    } else if (is_EOL(ch)) {
-      _line = state.line;
-      _lineStart = state.lineStart;
-      _lineIndent = state.lineIndent;
-      skipSeparationSpace(state, false, -1);
+               (withinFlowCollection && isFlowIndicator(ch))) {
+      break
+    } else if (isEol(ch)) {
+      _line = state.line
+      _lineStart = state.lineStart
+      _lineIndent = state.lineIndent
+      skipSeparationSpace(state, false, -1)
 
       if (state.lineIndent >= nodeIndent) {
-        hasPendingContent = true;
-        ch = state.input.charCodeAt(state.position);
-        continue;
+        hasPendingContent = true
+        ch = state.input.charCodeAt(state.position)
+        continue
       } else {
-        state.position = captureEnd;
-        state.line = _line;
-        state.lineStart = _lineStart;
-        state.lineIndent = _lineIndent;
-        break;
+        state.position = captureEnd
+        state.line = _line
+        state.lineStart = _lineStart
+        state.lineIndent = _lineIndent
+        break
       }
     }
 
     if (hasPendingContent) {
-      captureSegment(state, captureStart, captureEnd, false);
-      writeFoldedLines(state, state.line - _line);
-      captureStart = captureEnd = state.position;
-      hasPendingContent = false;
+      captureSegment(state, captureStart, captureEnd, false)
+      writeFoldedLines(state, state.line - _line)
+      captureStart = captureEnd = state.position
+      hasPendingContent = false
     }
 
-    if (!is_WHITE_SPACE(ch)) {
-      captureEnd = state.position + 1;
+    if (!isWhiteSpace(ch)) {
+      captureEnd = state.position + 1
     }
 
-    ch = state.input.charCodeAt(++state.position);
+    ch = state.input.charCodeAt(++state.position)
   }
 
-  captureSegment(state, captureStart, captureEnd, false);
+  captureSegment(state, captureStart, captureEnd, false)
 
   if (state.result) {
-    return true;
+    return true
   }
 
-  state.kind = _kind;
-  state.result = _result;
-  return false;
+  state.kind = _kind
+  state.result = _result
+  return false
 }
 
-function readSingleQuotedScalar(state, nodeIndent) {
-  var ch,
-      captureStart, captureEnd;
+function readSingleQuotedScalar (state, nodeIndent) {
+  let captureStart
+  let captureEnd
 
-  ch = state.input.charCodeAt(state.position);
+  let ch = state.input.charCodeAt(state.position)
 
   if (ch !== 0x27/* ' */) {
-    return false;
+    return false
   }
 
-  state.kind = 'scalar';
-  state.result = '';
-  state.position++;
-  captureStart = captureEnd = state.position;
+  state.kind = 'scalar'
+  state.result = ''
+  state.position++
+  captureStart = captureEnd = state.position
 
   while ((ch = state.input.charCodeAt(state.position)) !== 0) {
     if (ch === 0x27/* ' */) {
-      captureSegment(state, captureStart, state.position, true);
-      ch = state.input.charCodeAt(++state.position);
+      captureSegment(state, captureStart, state.position, true)
+      ch = state.input.charCodeAt(++state.position)
 
       if (ch === 0x27/* ' */) {
-        captureStart = state.position;
-        state.position++;
-        captureEnd = state.position;
+        captureStart = state.position
+        state.position++
+        captureEnd = state.position
       } else {
-        return true;
+        return true
       }
-
-    } else if (is_EOL(ch)) {
-      captureSegment(state, captureStart, captureEnd, true);
-      writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent));
-      captureStart = captureEnd = state.position;
-
+    } else if (isEol(ch)) {
+      captureSegment(state, captureStart, captureEnd, true)
+      writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent))
+      captureStart = captureEnd = state.position
     } else if (state.position === state.lineStart && testDocumentSeparator(state)) {
-      throwError(state, 'unexpected end of the document within a single quoted scalar');
-
+      throwError(state, 'unexpected end of the document within a single quoted scalar')
     } else {
-      state.position++;
-      captureEnd = state.position;
+      state.position++
+      if (!isWhiteSpace(ch)) {
+        captureEnd = state.position
+      }
     }
   }
 
-  throwError(state, 'unexpected end of the stream within a single quoted scalar');
+  throwError(state, 'unexpected end of the stream within a single quoted scalar')
 }
 
-function readDoubleQuotedScalar(state, nodeIndent) {
-  var captureStart,
-      captureEnd,
-      hexLength,
-      hexResult,
-      tmp,
-      ch;
+function readDoubleQuotedScalar (state, nodeIndent) {
+  let captureStart
+  let captureEnd
+  let tmp
 
-  ch = state.input.charCodeAt(state.position);
+  let ch = state.input.charCodeAt(state.position)
 
   if (ch !== 0x22/* " */) {
-    return false;
+    return false
   }
 
-  state.kind = 'scalar';
-  state.result = '';
-  state.position++;
-  captureStart = captureEnd = state.position;
+  state.kind = 'scalar'
+  state.result = ''
+  state.position++
+  captureStart = captureEnd = state.position
 
   while ((ch = state.input.charCodeAt(state.position)) !== 0) {
     if (ch === 0x22/* " */) {
-      captureSegment(state, captureStart, state.position, true);
-      state.position++;
-      return true;
-
+      captureSegment(state, captureStart, state.position, true)
+      state.position++
+      return true
     } else if (ch === 0x5C/* \ */) {
-      captureSegment(state, captureStart, state.position, true);
-      ch = state.input.charCodeAt(++state.position);
+      captureSegment(state, captureStart, state.position, true)
+      ch = state.input.charCodeAt(++state.position)
 
-      if (is_EOL(ch)) {
-        skipSeparationSpace(state, false, nodeIndent);
+      if (isEol(ch)) {
+        skipSeparationSpace(state, false, nodeIndent)
 
         // TODO: rework to inline fn with no type cast?
       } else if (ch < 256 && simpleEscapeCheck[ch]) {
-        state.result += simpleEscapeMap[ch];
-        state.position++;
-
+        state.result += simpleEscapeMap[ch]
+        state.position++
       } else if ((tmp = escapedHexLen(ch)) > 0) {
-        hexLength = tmp;
-        hexResult = 0;
+        let hexLength = tmp
+        let hexResult = 0
 
         for (; hexLength > 0; hexLength--) {
-          ch = state.input.charCodeAt(++state.position);
+          ch = state.input.charCodeAt(++state.position)
 
           if ((tmp = fromHexCode(ch)) >= 0) {
-            hexResult = (hexResult << 4) + tmp;
-
+            hexResult = (hexResult << 4) + tmp
           } else {
-            throwError(state, 'expected hexadecimal character');
+            throwError(state, 'expected hexadecimal character')
           }
         }
 
-        state.result += charFromCodepoint(hexResult);
+        state.result += charFromCodepoint(hexResult)
 
-        state.position++;
-
+        state.position++
       } else {
-        throwError(state, 'unknown escape sequence');
+        throwError(state, 'unknown escape sequence')
       }
 
-      captureStart = captureEnd = state.position;
-
-    } else if (is_EOL(ch)) {
-      captureSegment(state, captureStart, captureEnd, true);
-      writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent));
-      captureStart = captureEnd = state.position;
-
+      captureStart = captureEnd = state.position
+    } else if (isEol(ch)) {
+      captureSegment(state, captureStart, captureEnd, true)
+      writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent))
+      captureStart = captureEnd = state.position
     } else if (state.position === state.lineStart && testDocumentSeparator(state)) {
-      throwError(state, 'unexpected end of the document within a double quoted scalar');
-
+      throwError(state, 'unexpected end of the document within a double quoted scalar')
     } else {
-      state.position++;
-      captureEnd = state.position;
+      state.position++
+      if (!isWhiteSpace(ch)) {
+        captureEnd = state.position
+      }
     }
   }
 
-  throwError(state, 'unexpected end of the stream within a double quoted scalar');
+  throwError(state, 'unexpected end of the stream within a double quoted scalar')
 }
 
-function readFlowCollection(state, nodeIndent) {
-  var readNext = true,
-      _line,
-      _lineStart,
-      _pos,
-      _tag     = state.tag,
-      _result,
-      _anchor  = state.anchor,
-      following,
-      terminator,
-      isPair,
-      isExplicitPair,
-      isMapping,
-      overridableKeys = Object.create(null),
-      keyNode,
-      keyTag,
-      valueNode,
-      ch;
+function readFlowCollection (state, nodeIndent) {
+  let readNext = true
+  let _line
+  let _lineStart
+  let _pos
+  const _tag = state.tag
+  let _result
+  const _anchor = state.anchor
+  let terminator
+  let isPair
+  let isExplicitPair
+  let isMapping
+  const overridableKeys = Object.create(null)
+  let keyNode
+  let keyTag
+  let valueNode
 
-  ch = state.input.charCodeAt(state.position);
+  let ch = state.input.charCodeAt(state.position)
 
   if (ch === 0x5B/* [ */) {
-    terminator = 0x5D;/* ] */
-    isMapping = false;
-    _result = [];
+    terminator = 0x5D/* ] */
+    isMapping = false
+    _result = []
   } else if (ch === 0x7B/* { */) {
-    terminator = 0x7D;/* } */
-    isMapping = true;
-    _result = {};
+    terminator = 0x7D/* } */
+    isMapping = true
+    _result = {}
   } else {
-    return false;
+    return false
   }
 
   if (state.anchor !== null) {
-    state.anchorMap[state.anchor] = _result;
+    storeAnchor(state, state.anchor, _result)
   }
 
-  ch = state.input.charCodeAt(++state.position);
+  ch = state.input.charCodeAt(++state.position)
 
   while (ch !== 0) {
-    skipSeparationSpace(state, true, nodeIndent);
+    skipSeparationSpace(state, true, nodeIndent)
 
-    ch = state.input.charCodeAt(state.position);
+    ch = state.input.charCodeAt(state.position)
 
     if (ch === terminator) {
-      state.position++;
-      state.tag = _tag;
-      state.anchor = _anchor;
-      state.kind = isMapping ? 'mapping' : 'sequence';
-      state.result = _result;
-      return true;
+      state.position++
+      state.tag = _tag
+      state.anchor = _anchor
+      state.kind = isMapping ? 'mapping' : 'sequence'
+      state.result = _result
+      return true
     } else if (!readNext) {
-      throwError(state, 'missed comma between flow collection entries');
+      throwError(state, 'missed comma between flow collection entries')
     } else if (ch === 0x2C/* , */) {
       // "flow collection entries can never be completely empty", as per YAML 1.2, section 7.4
-      throwError(state, "expected the node content, but found ','");
+      throwError(state, "expected the node content, but found ','")
     }
 
-    keyTag = keyNode = valueNode = null;
-    isPair = isExplicitPair = false;
+    keyTag = keyNode = valueNode = null
+    isPair = isExplicitPair = false
 
     if (ch === 0x3F/* ? */) {
-      following = state.input.charCodeAt(state.position + 1);
+      const following = state.input.charCodeAt(state.position + 1)
 
-      if (is_WS_OR_EOL(following)) {
-        isPair = isExplicitPair = true;
-        state.position++;
-        skipSeparationSpace(state, true, nodeIndent);
+      if (isWsOrEol(following)) {
+        isPair = isExplicitPair = true
+        state.position++
+        skipSeparationSpace(state, true, nodeIndent)
       }
     }
 
-    _line = state.line; // Save the current line.
-    _lineStart = state.lineStart;
-    _pos = state.position;
-    composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true);
-    keyTag = state.tag;
-    keyNode = state.result;
-    skipSeparationSpace(state, true, nodeIndent);
+    _line = state.line // Save the current line.
+    _lineStart = state.lineStart
+    _pos = state.position
+    composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true)
+    keyTag = state.tag
+    keyNode = state.result
+    skipSeparationSpace(state, true, nodeIndent)
 
-    ch = state.input.charCodeAt(state.position);
+    ch = state.input.charCodeAt(state.position)
 
     if ((isExplicitPair || state.line === _line) && ch === 0x3A/* : */) {
-      isPair = true;
-      ch = state.input.charCodeAt(++state.position);
-      skipSeparationSpace(state, true, nodeIndent);
-      composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true);
-      valueNode = state.result;
+      isPair = true
+      ch = state.input.charCodeAt(++state.position)
+      skipSeparationSpace(state, true, nodeIndent)
+      composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true)
+      valueNode = state.result
     }
 
     if (isMapping) {
-      storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos);
+      storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos)
     } else if (isPair) {
-      _result.push(storeMappingPair(state, null, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos));
+      _result.push(storeMappingPair(state, null, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos))
     } else {
-      _result.push(keyNode);
+      _result.push(keyNode)
     }
 
-    skipSeparationSpace(state, true, nodeIndent);
+    skipSeparationSpace(state, true, nodeIndent)
 
-    ch = state.input.charCodeAt(state.position);
+    ch = state.input.charCodeAt(state.position)
 
     if (ch === 0x2C/* , */) {
-      readNext = true;
-      ch = state.input.charCodeAt(++state.position);
+      readNext = true
+      ch = state.input.charCodeAt(++state.position)
     } else {
-      readNext = false;
+      readNext = false
     }
   }
 
-  throwError(state, 'unexpected end of the stream within a flow collection');
+  throwError(state, 'unexpected end of the stream within a flow collection')
 }
 
-function readBlockScalar(state, nodeIndent) {
-  var captureStart,
-      folding,
-      chomping       = CHOMPING_CLIP,
-      didReadContent = false,
-      detectedIndent = false,
-      textIndent     = nodeIndent,
-      emptyLines     = 0,
-      atMoreIndented = false,
-      tmp,
-      ch;
+function readBlockScalar (state, nodeIndent) {
+  let folding
+  let chomping = CHOMPING_CLIP
+  let didReadContent = false
+  let detectedIndent = false
+  let textIndent = nodeIndent
+  let emptyLines = 0
+  let atMoreIndented = false
+  let tmp
 
-  ch = state.input.charCodeAt(state.position);
+  let ch = state.input.charCodeAt(state.position)
 
   if (ch === 0x7C/* | */) {
-    folding = false;
+    folding = false
   } else if (ch === 0x3E/* > */) {
-    folding = true;
+    folding = true
   } else {
-    return false;
+    return false
   }
 
-  state.kind = 'scalar';
-  state.result = '';
+  state.kind = 'scalar'
+  state.result = ''
 
   while (ch !== 0) {
-    ch = state.input.charCodeAt(++state.position);
+    ch = state.input.charCodeAt(++state.position)
 
     if (ch === 0x2B/* + */ || ch === 0x2D/* - */) {
       if (CHOMPING_CLIP === chomping) {
-        chomping = (ch === 0x2B/* + */) ? CHOMPING_KEEP : CHOMPING_STRIP;
+        chomping = (ch === 0x2B/* + */) ? CHOMPING_KEEP : CHOMPING_STRIP
       } else {
-        throwError(state, 'repeat of a chomping mode identifier');
+        throwError(state, 'repeat of a chomping mode identifier')
       }
-
     } else if ((tmp = fromDecimalCode(ch)) >= 0) {
       if (tmp === 0) {
-        throwError(state, 'bad explicit indentation width of a block scalar; it cannot be less than one');
+        throwError(state, 'bad explicit indentation width of a block scalar; it cannot be less than one')
       } else if (!detectedIndent) {
-        textIndent = nodeIndent + tmp - 1;
-        detectedIndent = true;
+        textIndent = nodeIndent + tmp - 1
+        detectedIndent = true
       } else {
-        throwError(state, 'repeat of an indentation width identifier');
+        throwError(state, 'repeat of an indentation width identifier')
       }
-
     } else {
-      break;
+      break
     }
   }
 
-  if (is_WHITE_SPACE(ch)) {
-    do { ch = state.input.charCodeAt(++state.position); }
-    while (is_WHITE_SPACE(ch));
+  if (isWhiteSpace(ch)) {
+    do { ch = state.input.charCodeAt(++state.position) }
+    while (isWhiteSpace(ch))
 
     if (ch === 0x23/* # */) {
-      do { ch = state.input.charCodeAt(++state.position); }
-      while (!is_EOL(ch) && (ch !== 0));
+      do { ch = state.input.charCodeAt(++state.position) }
+      while (!isEol(ch) && (ch !== 0))
     }
   }
 
   while (ch !== 0) {
-    readLineBreak(state);
-    state.lineIndent = 0;
+    readLineBreak(state)
+    state.lineIndent = 0
 
-    ch = state.input.charCodeAt(state.position);
+    ch = state.input.charCodeAt(state.position)
 
+    // eslint-disable-next-line no-unmodified-loop-condition
     while ((!detectedIndent || state.lineIndent < textIndent) &&
            (ch === 0x20/* Space */)) {
-      state.lineIndent++;
-      ch = state.input.charCodeAt(++state.position);
+      state.lineIndent++
+      ch = state.input.charCodeAt(++state.position)
     }
 
     if (!detectedIndent && state.lineIndent > textIndent) {
-      textIndent = state.lineIndent;
+      textIndent = state.lineIndent
     }
 
-    if (is_EOL(ch)) {
-      emptyLines++;
-      continue;
+    if (isEol(ch)) {
+      emptyLines++
+      continue
+    }
+
+    if (!detectedIndent && textIndent === 0) {
+      throwError(state, 'missing indentation for block scalar')
     }
 
     // End of the scalar.
     if (state.lineIndent < textIndent) {
-
       // Perform the chomping.
       if (chomping === CHOMPING_KEEP) {
-        state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines);
+        state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines)
       } else if (chomping === CHOMPING_CLIP) {
         if (didReadContent) { // i.e. only if the scalar is not empty.
-          state.result += '\n';
+          state.result += '\n'
         }
       }
 
       // Break this `while` cycle and go to the funciton's epilogue.
-      break;
+      break
     }
 
     // Folded style: use fancy rules to handle line breaks.
     if (folding) {
-
       // Lines starting with white space characters (more-indented lines) are not folded.
-      if (is_WHITE_SPACE(ch)) {
-        atMoreIndented = true;
+      if (isWhiteSpace(ch)) {
+        atMoreIndented = true
         // except for the first content line (cf. Example 8.1)
-        state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines);
+        state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines)
 
       // End of more-indented block.
       } else if (atMoreIndented) {
-        atMoreIndented = false;
-        state.result += common.repeat('\n', emptyLines + 1);
+        atMoreIndented = false
+        state.result += common.repeat('\n', emptyLines + 1)
 
       // Just one line break - perceive as the same line.
       } else if (emptyLines === 0) {
         if (didReadContent) { // i.e. only if we have already read some scalar content.
-          state.result += ' ';
+          state.result += ' '
         }
 
       // Several line breaks - perceive as different lines.
       } else {
-        state.result += common.repeat('\n', emptyLines);
+        state.result += common.repeat('\n', emptyLines)
       }
 
     // Literal style: just add exact number of line breaks between content lines.
     } else {
       // Keep all line breaks except the header line break.
-      state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines);
+      state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines)
     }
 
-    didReadContent = true;
-    detectedIndent = true;
-    emptyLines = 0;
-    captureStart = state.position;
+    didReadContent = true
+    detectedIndent = true
+    emptyLines = 0
+    const captureStart = state.position
 
-    while (!is_EOL(ch) && (ch !== 0)) {
-      ch = state.input.charCodeAt(++state.position);
+    while (!isEol(ch) && (ch !== 0)) {
+      ch = state.input.charCodeAt(++state.position)
     }
 
-    captureSegment(state, captureStart, state.position, false);
+    captureSegment(state, captureStart, state.position, false)
   }
 
-  return true;
+  return true
 }
 
-function readBlockSequence(state, nodeIndent) {
-  var _line,
-      _tag      = state.tag,
-      _anchor   = state.anchor,
-      _result   = [],
-      following,
-      detected  = false,
-      ch;
+function readBlockSequence (state, nodeIndent) {
+  const _tag = state.tag
+  const _anchor = state.anchor
+  const _result = []
+  let detected = false
 
   // there is a leading tab before this token, so it can't be a block sequence/mapping;
   // it can still be flow sequence/mapping or a scalar
-  if (state.firstTabInLine !== -1) return false;
+  if (state.firstTabInLine !== -1) return false
 
   if (state.anchor !== null) {
-    state.anchorMap[state.anchor] = _result;
+    storeAnchor(state, state.anchor, _result)
   }
 
-  ch = state.input.charCodeAt(state.position);
+  let ch = state.input.charCodeAt(state.position)
 
   while (ch !== 0) {
     if (state.firstTabInLine !== -1) {
-      state.position = state.firstTabInLine;
-      throwError(state, 'tab characters must not be used in indentation');
+      state.position = state.firstTabInLine
+      throwError(state, 'tab characters must not be used in indentation')
     }
 
     if (ch !== 0x2D/* - */) {
-      break;
+      break
     }
 
-    following = state.input.charCodeAt(state.position + 1);
+    const following = state.input.charCodeAt(state.position + 1)
 
-    if (!is_WS_OR_EOL(following)) {
-      break;
+    if (!isWsOrEol(following)) {
+      break
     }
 
-    detected = true;
-    state.position++;
+    detected = true
+    state.position++
 
     if (skipSeparationSpace(state, true, -1)) {
       if (state.lineIndent <= nodeIndent) {
-        _result.push(null);
-        ch = state.input.charCodeAt(state.position);
-        continue;
+        _result.push(null)
+        ch = state.input.charCodeAt(state.position)
+        continue
       }
     }
 
-    _line = state.line;
-    composeNode(state, nodeIndent, CONTEXT_BLOCK_IN, false, true);
-    _result.push(state.result);
-    skipSeparationSpace(state, true, -1);
+    const _line = state.line
+    composeNode(state, nodeIndent, CONTEXT_BLOCK_IN, false, true)
+    _result.push(state.result)
+    skipSeparationSpace(state, true, -1)
 
-    ch = state.input.charCodeAt(state.position);
+    ch = state.input.charCodeAt(state.position)
 
     if ((state.line === _line || state.lineIndent > nodeIndent) && (ch !== 0)) {
-      throwError(state, 'bad indentation of a sequence entry');
+      throwError(state, 'bad indentation of a sequence entry')
     } else if (state.lineIndent < nodeIndent) {
-      break;
+      break
     }
   }
 
   if (detected) {
-    state.tag = _tag;
-    state.anchor = _anchor;
-    state.kind = 'sequence';
-    state.result = _result;
-    return true;
+    state.tag = _tag
+    state.anchor = _anchor
+    state.kind = 'sequence'
+    state.result = _result
+    return true
   }
-  return false;
+  return false
 }
 
-function readBlockMapping(state, nodeIndent, flowIndent) {
-  var following,
-      allowCompact,
-      _line,
-      _keyLine,
-      _keyLineStart,
-      _keyPos,
-      _tag          = state.tag,
-      _anchor       = state.anchor,
-      _result       = {},
-      overridableKeys = Object.create(null),
-      keyTag        = null,
-      keyNode       = null,
-      valueNode     = null,
-      atExplicitKey = false,
-      detected      = false,
-      ch;
+function readBlockMapping (state, nodeIndent, flowIndent) {
+  let allowCompact
+  let _keyLine
+  let _keyLineStart
+  let _keyPos
+  const _tag = state.tag
+  const _anchor = state.anchor
+  const _result = {}
+  const overridableKeys = Object.create(null)
+  let keyTag = null
+  let keyNode = null
+  let valueNode = null
+  let atExplicitKey = false
+  let detected = false
 
   // there is a leading tab before this token, so it can't be a block sequence/mapping;
   // it can still be flow sequence/mapping or a scalar
-  if (state.firstTabInLine !== -1) return false;
+  if (state.firstTabInLine !== -1) return false
 
   if (state.anchor !== null) {
-    state.anchorMap[state.anchor] = _result;
+    storeAnchor(state, state.anchor, _result)
   }
 
-  ch = state.input.charCodeAt(state.position);
+  let ch = state.input.charCodeAt(state.position)
 
   while (ch !== 0) {
     if (!atExplicitKey && state.firstTabInLine !== -1) {
-      state.position = state.firstTabInLine;
-      throwError(state, 'tab characters must not be used in indentation');
+      state.position = state.firstTabInLine
+      throwError(state, 'tab characters must not be used in indentation')
     }
 
-    following = state.input.charCodeAt(state.position + 1);
-    _line = state.line; // Save the current line.
+    const following = state.input.charCodeAt(state.position + 1)
+    const _line = state.line // Save the current line.
 
     //
     // Explicit notation case. There are two separate blocks:
     // first for the key (denoted by "?") and second for the value (denoted by ":")
     //
-    if ((ch === 0x3F/* ? */ || ch === 0x3A/* : */) && is_WS_OR_EOL(following)) {
-
+    if ((ch === 0x3F/* ? */ || ch === 0x3A/* : */) && isWsOrEol(following)) {
       if (ch === 0x3F/* ? */) {
         if (atExplicitKey) {
-          storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
-          keyTag = keyNode = valueNode = null;
+          storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos)
+          keyTag = keyNode = valueNode = null
         }
 
-        detected = true;
-        atExplicitKey = true;
-        allowCompact = true;
-
+        detected = true
+        atExplicitKey = true
+        allowCompact = true
       } else if (atExplicitKey) {
         // i.e. 0x3A/* : */ === character after the explicit key.
-        atExplicitKey = false;
-        allowCompact = true;
-
+        atExplicitKey = false
+        allowCompact = true
       } else {
-        throwError(state, 'incomplete explicit mapping pair; a key node is missed; or followed by a non-tabulated empty line');
+        throwError(state, 'incomplete explicit mapping pair; a key node is missed; or followed by a non-tabulated empty line')
       }
 
-      state.position += 1;
-      ch = following;
+      state.position += 1
+      ch = following
 
     //
     // Implicit notation case. Flow-style node as the key first, then ":", and the value.
     //
     } else {
-      _keyLine = state.line;
-      _keyLineStart = state.lineStart;
-      _keyPos = state.position;
+      _keyLine = state.line
+      _keyLineStart = state.lineStart
+      _keyPos = state.position
 
       if (!composeNode(state, flowIndent, CONTEXT_FLOW_OUT, false, true)) {
         // Neither implicit nor explicit notation.
         // Reading is done. Go to the epilogue.
-        break;
+        break
       }
 
       if (state.line === _line) {
-        ch = state.input.charCodeAt(state.position);
+        ch = state.input.charCodeAt(state.position)
 
-        while (is_WHITE_SPACE(ch)) {
-          ch = state.input.charCodeAt(++state.position);
+        while (isWhiteSpace(ch)) {
+          ch = state.input.charCodeAt(++state.position)
         }
 
         if (ch === 0x3A/* : */) {
-          ch = state.input.charCodeAt(++state.position);
+          ch = state.input.charCodeAt(++state.position)
 
-          if (!is_WS_OR_EOL(ch)) {
-            throwError(state, 'a whitespace character is expected after the key-value separator within a block mapping');
+          if (!isWsOrEol(ch)) {
+            throwError(state, 'a whitespace character is expected after the key-value separator within a block mapping')
           }
 
           if (atExplicitKey) {
-            storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
-            keyTag = keyNode = valueNode = null;
+            storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos)
+            keyTag = keyNode = valueNode = null
           }
 
-          detected = true;
-          atExplicitKey = false;
-          allowCompact = false;
-          keyTag = state.tag;
-          keyNode = state.result;
-
+          detected = true
+          atExplicitKey = false
+          allowCompact = false
+          keyTag = state.tag
+          keyNode = state.result
         } else if (detected) {
-          throwError(state, 'can not read an implicit mapping pair; a colon is missed');
-
+          throwError(state, 'can not read an implicit mapping pair; a colon is missed')
         } else {
-          state.tag = _tag;
-          state.anchor = _anchor;
-          return true; // Keep the result of `composeNode`.
+          state.tag = _tag
+          state.anchor = _anchor
+          return true // Keep the result of `composeNode`.
         }
-
       } else if (detected) {
-        throwError(state, 'can not read a block mapping entry; a multiline key may not be an implicit key');
-
+        throwError(state, 'can not read a block mapping entry; a multiline key may not be an implicit key')
       } else {
-        state.tag = _tag;
-        state.anchor = _anchor;
-        return true; // Keep the result of `composeNode`.
+        state.tag = _tag
+        state.anchor = _anchor
+        return true // Keep the result of `composeNode`.
       }
     }
 
@@ -36135,32 +34537,32 @@ function readBlockMapping(state, nodeIndent, flowIndent) {
     //
     if (state.line === _line || state.lineIndent > nodeIndent) {
       if (atExplicitKey) {
-        _keyLine = state.line;
-        _keyLineStart = state.lineStart;
-        _keyPos = state.position;
+        _keyLine = state.line
+        _keyLineStart = state.lineStart
+        _keyPos = state.position
       }
 
       if (composeNode(state, nodeIndent, CONTEXT_BLOCK_OUT, true, allowCompact)) {
         if (atExplicitKey) {
-          keyNode = state.result;
+          keyNode = state.result
         } else {
-          valueNode = state.result;
+          valueNode = state.result
         }
       }
 
       if (!atExplicitKey) {
-        storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _keyLine, _keyLineStart, _keyPos);
-        keyTag = keyNode = valueNode = null;
+        storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _keyLine, _keyLineStart, _keyPos)
+        keyTag = keyNode = valueNode = null
       }
 
-      skipSeparationSpace(state, true, -1);
-      ch = state.input.charCodeAt(state.position);
+      skipSeparationSpace(state, true, -1)
+      ch = state.input.charCodeAt(state.position)
     }
 
     if ((state.line === _line || state.lineIndent > nodeIndent) && (ch !== 0)) {
-      throwError(state, 'bad indentation of a mapping entry');
+      throwError(state, 'bad indentation of a mapping entry')
     } else if (state.lineIndent < nodeIndent) {
-      break;
+      break
     }
   }
 
@@ -36170,293 +34572,330 @@ function readBlockMapping(state, nodeIndent, flowIndent) {
 
   // Special case: last mapping's node contains only the key in explicit notation.
   if (atExplicitKey) {
-    storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
+    storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos)
   }
 
   // Expose the resulting mapping.
   if (detected) {
-    state.tag = _tag;
-    state.anchor = _anchor;
-    state.kind = 'mapping';
-    state.result = _result;
+    state.tag = _tag
+    state.anchor = _anchor
+    state.kind = 'mapping'
+    state.result = _result
   }
 
-  return detected;
+  return detected
 }
 
-function readTagProperty(state) {
-  var _position,
-      isVerbatim = false,
-      isNamed    = false,
-      tagHandle,
-      tagName,
-      ch;
+function readTagProperty (state) {
+  let isVerbatim = false
+  let isNamed = false
+  let tagHandle
+  let tagName
 
-  ch = state.input.charCodeAt(state.position);
+  let ch = state.input.charCodeAt(state.position)
 
-  if (ch !== 0x21/* ! */) return false;
+  if (ch !== 0x21/* ! */) return false
 
   if (state.tag !== null) {
-    throwError(state, 'duplication of a tag property');
+    throwError(state, 'duplication of a tag property')
   }
 
-  ch = state.input.charCodeAt(++state.position);
+  ch = state.input.charCodeAt(++state.position)
 
   if (ch === 0x3C/* < */) {
-    isVerbatim = true;
-    ch = state.input.charCodeAt(++state.position);
-
+    isVerbatim = true
+    ch = state.input.charCodeAt(++state.position)
   } else if (ch === 0x21/* ! */) {
-    isNamed = true;
-    tagHandle = '!!';
-    ch = state.input.charCodeAt(++state.position);
-
+    isNamed = true
+    tagHandle = '!!'
+    ch = state.input.charCodeAt(++state.position)
   } else {
-    tagHandle = '!';
+    tagHandle = '!'
   }
 
-  _position = state.position;
+  let _position = state.position
 
   if (isVerbatim) {
-    do { ch = state.input.charCodeAt(++state.position); }
-    while (ch !== 0 && ch !== 0x3E/* > */);
+    do { ch = state.input.charCodeAt(++state.position) }
+    while (ch !== 0 && ch !== 0x3E/* > */)
 
     if (state.position < state.length) {
-      tagName = state.input.slice(_position, state.position);
-      ch = state.input.charCodeAt(++state.position);
+      tagName = state.input.slice(_position, state.position)
+      ch = state.input.charCodeAt(++state.position)
     } else {
-      throwError(state, 'unexpected end of the stream within a verbatim tag');
+      throwError(state, 'unexpected end of the stream within a verbatim tag')
     }
   } else {
-    while (ch !== 0 && !is_WS_OR_EOL(ch)) {
-
+    while (ch !== 0 && !isWsOrEol(ch)) {
       if (ch === 0x21/* ! */) {
         if (!isNamed) {
-          tagHandle = state.input.slice(_position - 1, state.position + 1);
+          tagHandle = state.input.slice(_position - 1, state.position + 1)
 
           if (!PATTERN_TAG_HANDLE.test(tagHandle)) {
-            throwError(state, 'named tag handle cannot contain such characters');
+            throwError(state, 'named tag handle cannot contain such characters')
           }
 
-          isNamed = true;
-          _position = state.position + 1;
+          isNamed = true
+          _position = state.position + 1
         } else {
-          throwError(state, 'tag suffix cannot contain exclamation marks');
+          throwError(state, 'tag suffix cannot contain exclamation marks')
         }
       }
 
-      ch = state.input.charCodeAt(++state.position);
+      ch = state.input.charCodeAt(++state.position)
     }
 
-    tagName = state.input.slice(_position, state.position);
+    tagName = state.input.slice(_position, state.position)
 
     if (PATTERN_FLOW_INDICATORS.test(tagName)) {
-      throwError(state, 'tag suffix cannot contain flow indicator characters');
+      throwError(state, 'tag suffix cannot contain flow indicator characters')
     }
   }
 
   if (tagName && !PATTERN_TAG_URI.test(tagName)) {
-    throwError(state, 'tag name cannot contain such characters: ' + tagName);
+    throwError(state, 'tag name cannot contain such characters: ' + tagName)
   }
 
   try {
-    tagName = decodeURIComponent(tagName);
+    tagName = decodeURIComponent(tagName)
   } catch (err) {
-    throwError(state, 'tag name is malformed: ' + tagName);
+    throwError(state, 'tag name is malformed: ' + tagName)
   }
 
   if (isVerbatim) {
-    state.tag = tagName;
-
+    state.tag = tagName
   } else if (_hasOwnProperty.call(state.tagMap, tagHandle)) {
-    state.tag = state.tagMap[tagHandle] + tagName;
-
+    state.tag = state.tagMap[tagHandle] + tagName
   } else if (tagHandle === '!') {
-    state.tag = '!' + tagName;
-
+    state.tag = '!' + tagName
   } else if (tagHandle === '!!') {
-    state.tag = 'tag:yaml.org,2002:' + tagName;
-
+    state.tag = 'tag:yaml.org,2002:' + tagName
   } else {
-    throwError(state, 'undeclared tag handle "' + tagHandle + '"');
+    throwError(state, 'undeclared tag handle "' + tagHandle + '"')
   }
 
-  return true;
+  return true
 }
 
-function readAnchorProperty(state) {
-  var _position,
-      ch;
+function readAnchorProperty (state) {
+  let ch = state.input.charCodeAt(state.position)
 
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch !== 0x26/* & */) return false;
+  if (ch !== 0x26/* & */) return false
 
   if (state.anchor !== null) {
-    throwError(state, 'duplication of an anchor property');
+    throwError(state, 'duplication of an anchor property')
   }
 
-  ch = state.input.charCodeAt(++state.position);
-  _position = state.position;
+  ch = state.input.charCodeAt(++state.position)
+  const _position = state.position
 
-  while (ch !== 0 && !is_WS_OR_EOL(ch) && !is_FLOW_INDICATOR(ch)) {
-    ch = state.input.charCodeAt(++state.position);
+  while (ch !== 0 && !isWsOrEol(ch) && !isFlowIndicator(ch)) {
+    ch = state.input.charCodeAt(++state.position)
   }
 
   if (state.position === _position) {
-    throwError(state, 'name of an anchor node must contain at least one character');
+    throwError(state, 'name of an anchor node must contain at least one character')
   }
 
-  state.anchor = state.input.slice(_position, state.position);
-  return true;
+  state.anchor = state.input.slice(_position, state.position)
+  return true
 }
 
-function readAlias(state) {
-  var _position, alias,
-      ch;
+function readAlias (state) {
+  let ch = state.input.charCodeAt(state.position)
 
-  ch = state.input.charCodeAt(state.position);
+  if (ch !== 0x2A/* * */) return false
 
-  if (ch !== 0x2A/* * */) return false;
+  ch = state.input.charCodeAt(++state.position)
+  const _position = state.position
 
-  ch = state.input.charCodeAt(++state.position);
-  _position = state.position;
-
-  while (ch !== 0 && !is_WS_OR_EOL(ch) && !is_FLOW_INDICATOR(ch)) {
-    ch = state.input.charCodeAt(++state.position);
+  while (ch !== 0 && !isWsOrEol(ch) && !isFlowIndicator(ch)) {
+    ch = state.input.charCodeAt(++state.position)
   }
 
   if (state.position === _position) {
-    throwError(state, 'name of an alias node must contain at least one character');
+    throwError(state, 'name of an alias node must contain at least one character')
   }
 
-  alias = state.input.slice(_position, state.position);
+  const alias = state.input.slice(_position, state.position)
 
   if (!_hasOwnProperty.call(state.anchorMap, alias)) {
-    throwError(state, 'unidentified alias "' + alias + '"');
+    throwError(state, 'unidentified alias "' + alias + '"')
   }
 
-  state.result = state.anchorMap[alias];
-  skipSeparationSpace(state, true, -1);
-  return true;
+  state.result = state.anchorMap[alias]
+  skipSeparationSpace(state, true, -1)
+  return true
 }
 
-function composeNode(state, parentIndent, nodeContext, allowToSeek, allowCompact) {
-  var allowBlockStyles,
-      allowBlockScalars,
-      allowBlockCollections,
-      indentStatus = 1, // 1: this>parent, 0: this=parent, -1: this<parent
-      atNewLine  = false,
-      hasContent = false,
-      typeIndex,
-      typeQuantity,
-      typeList,
-      type,
-      flowIndent,
-      blockIndent;
+function tryReadBlockMappingFromProperty (state, propertyStart, nodeIndent, flowIndent) {
+  const fallbackState = snapshotState(state)
 
-  if (state.listener !== null) {
-    state.listener('open', state);
+  beginAnchorTransaction(state)
+  restoreState(state, propertyStart)
+
+  // Re-read the leading properties as part of the first implicit key, not as
+  // properties of the current node.
+  state.tag = null
+  state.anchor = null
+  state.kind = null
+  state.result = null
+
+  if (readBlockMapping(state, nodeIndent, flowIndent) && state.kind === 'mapping') {
+    commitAnchorTransaction(state)
+    return true
   }
 
-  state.tag    = null;
-  state.anchor = null;
-  state.kind   = null;
-  state.result = null;
+  rollbackAnchorTransaction(state)
+  restoreState(state, fallbackState)
+  return false
+}
 
-  allowBlockStyles = allowBlockScalars = allowBlockCollections =
+function composeNode (state, parentIndent, nodeContext, allowToSeek, allowCompact) {
+  let allowBlockScalars
+  let allowBlockCollections
+  let indentStatus = 1 // 1: this>parent, 0: this=parent, -1: this<parent
+  let atNewLine = false
+  let hasContent = false
+  let propertyStart = null
+  let type
+  let flowIndent
+  let blockIndent
+
+  if (state.depth >= state.maxDepth) {
+    throwError(state, 'nesting exceeded maxDepth (' + state.maxDepth + ')')
+  }
+
+  state.depth += 1
+
+  if (state.listener !== null) {
+    state.listener('open', state)
+  }
+
+  state.tag = null
+  state.anchor = null
+  state.kind = null
+  state.result = null
+
+  const allowBlockStyles = allowBlockScalars = allowBlockCollections =
     CONTEXT_BLOCK_OUT === nodeContext ||
-    CONTEXT_BLOCK_IN  === nodeContext;
+    CONTEXT_BLOCK_IN === nodeContext
 
   if (allowToSeek) {
     if (skipSeparationSpace(state, true, -1)) {
-      atNewLine = true;
+      atNewLine = true
 
       if (state.lineIndent > parentIndent) {
-        indentStatus = 1;
+        indentStatus = 1
       } else if (state.lineIndent === parentIndent) {
-        indentStatus = 0;
+        indentStatus = 0
       } else if (state.lineIndent < parentIndent) {
-        indentStatus = -1;
+        indentStatus = -1
       }
     }
   }
 
   if (indentStatus === 1) {
-    while (readTagProperty(state) || readAnchorProperty(state)) {
+    while (true) {
+      const ch = state.input.charCodeAt(state.position)
+      const propertyState = snapshotState(state)
+
+      // A duplicate property token after a line break can be the first key of
+      // a nested block mapping, e.g. `!!map\n  !!str key: value`.
+      if (atNewLine &&
+          ((ch === 0x21/* ! */ && state.tag !== null) ||
+           (ch === 0x26/* & */ && state.anchor !== null))) {
+        break
+      }
+
+      if (!readTagProperty(state) && !readAnchorProperty(state)) {
+        break
+      }
+
+      if (propertyStart === null) {
+        propertyStart = propertyState
+      }
+
       if (skipSeparationSpace(state, true, -1)) {
-        atNewLine = true;
-        allowBlockCollections = allowBlockStyles;
+        atNewLine = true
+        allowBlockCollections = allowBlockStyles
 
         if (state.lineIndent > parentIndent) {
-          indentStatus = 1;
+          indentStatus = 1
         } else if (state.lineIndent === parentIndent) {
-          indentStatus = 0;
+          indentStatus = 0
         } else if (state.lineIndent < parentIndent) {
-          indentStatus = -1;
+          indentStatus = -1
         }
       } else {
-        allowBlockCollections = false;
+        allowBlockCollections = false
       }
     }
   }
 
   if (allowBlockCollections) {
-    allowBlockCollections = atNewLine || allowCompact;
+    allowBlockCollections = atNewLine || allowCompact
   }
 
   if (indentStatus === 1 || CONTEXT_BLOCK_OUT === nodeContext) {
     if (CONTEXT_FLOW_IN === nodeContext || CONTEXT_FLOW_OUT === nodeContext) {
-      flowIndent = parentIndent;
+      flowIndent = parentIndent
     } else {
-      flowIndent = parentIndent + 1;
+      flowIndent = parentIndent + 1
     }
 
-    blockIndent = state.position - state.lineStart;
+    blockIndent = state.position - state.lineStart
 
     if (indentStatus === 1) {
-      if (allowBlockCollections &&
-          (readBlockSequence(state, blockIndent) ||
-           readBlockMapping(state, blockIndent, flowIndent)) ||
+      if ((allowBlockCollections &&
+          (readBlockSequence(state, blockIndent) || readBlockMapping(state, blockIndent, flowIndent))) ||
           readFlowCollection(state, flowIndent)) {
-        hasContent = true;
+        hasContent = true
       } else {
-        if ((allowBlockScalars && readBlockScalar(state, flowIndent)) ||
+        const ch = state.input.charCodeAt(state.position)
+
+        if (propertyStart !== null && allowBlockStyles && !allowBlockCollections &&
+            ch !== 0x7C/* | */ && ch !== 0x3E/* > */ &&
+            tryReadBlockMappingFromProperty(
+              state,
+              propertyStart,
+              propertyStart.position - propertyStart.lineStart,
+              flowIndent
+            )) {
+          hasContent = true
+        } else if ((allowBlockScalars && readBlockScalar(state, flowIndent)) ||
             readSingleQuotedScalar(state, flowIndent) ||
             readDoubleQuotedScalar(state, flowIndent)) {
-          hasContent = true;
-
+          hasContent = true
         } else if (readAlias(state)) {
-          hasContent = true;
+          hasContent = true
 
           if (state.tag !== null || state.anchor !== null) {
-            throwError(state, 'alias node should not have any properties');
+            throwError(state, 'alias node should not have any properties')
           }
-
         } else if (readPlainScalar(state, flowIndent, CONTEXT_FLOW_IN === nodeContext)) {
-          hasContent = true;
+          hasContent = true
 
           if (state.tag === null) {
-            state.tag = '?';
+            state.tag = '?'
           }
         }
 
         if (state.anchor !== null) {
-          state.anchorMap[state.anchor] = state.result;
+          storeAnchor(state, state.anchor, state.result)
         }
       }
     } else if (indentStatus === 0) {
       // Special case: block sequences are allowed to have same indentation level as the parent.
       // http://www.yaml.org/spec/1.2/spec.html#id2799784
-      hasContent = allowBlockCollections && readBlockSequence(state, blockIndent);
+      hasContent = allowBlockCollections && readBlockSequence(state, blockIndent)
     }
   }
 
   if (state.tag === null) {
     if (state.anchor !== null) {
-      state.anchorMap[state.anchor] = state.result;
+      storeAnchor(state, state.anchor, state.result)
     }
-
   } else if (state.tag === '?') {
     // Implicit resolving is not allowed for non-scalar types, and '?'
     // non-specific tag is only automatically assigned to plain scalars.
@@ -36465,245 +34904,234 @@ function composeNode(state, parentIndent, nodeContext, allowToSeek, allowCompact
     // tag, for example like this: "!<?> [0]"
     //
     if (state.result !== null && state.kind !== 'scalar') {
-      throwError(state, 'unacceptable node kind for !<?> tag; it should be "scalar", not "' + state.kind + '"');
+      throwError(state, 'unacceptable node kind for !<?> tag; it should be "scalar", not "' + state.kind + '"')
     }
 
-    for (typeIndex = 0, typeQuantity = state.implicitTypes.length; typeIndex < typeQuantity; typeIndex += 1) {
-      type = state.implicitTypes[typeIndex];
+    for (let typeIndex = 0, typeQuantity = state.implicitTypes.length; typeIndex < typeQuantity; typeIndex += 1) {
+      type = state.implicitTypes[typeIndex]
 
       if (type.resolve(state.result)) { // `state.result` updated in resolver if matched
-        state.result = type.construct(state.result);
-        state.tag = type.tag;
+        state.result = type.construct(state.result)
+        state.tag = type.tag
         if (state.anchor !== null) {
-          state.anchorMap[state.anchor] = state.result;
+          storeAnchor(state, state.anchor, state.result)
         }
-        break;
+        break
       }
     }
   } else if (state.tag !== '!') {
     if (_hasOwnProperty.call(state.typeMap[state.kind || 'fallback'], state.tag)) {
-      type = state.typeMap[state.kind || 'fallback'][state.tag];
+      type = state.typeMap[state.kind || 'fallback'][state.tag]
     } else {
       // looking for multi type
-      type = null;
-      typeList = state.typeMap.multi[state.kind || 'fallback'];
+      type = null
+      const typeList = state.typeMap.multi[state.kind || 'fallback']
 
-      for (typeIndex = 0, typeQuantity = typeList.length; typeIndex < typeQuantity; typeIndex += 1) {
+      for (let typeIndex = 0, typeQuantity = typeList.length; typeIndex < typeQuantity; typeIndex += 1) {
         if (state.tag.slice(0, typeList[typeIndex].tag.length) === typeList[typeIndex].tag) {
-          type = typeList[typeIndex];
-          break;
+          type = typeList[typeIndex]
+          break
         }
       }
     }
 
     if (!type) {
-      throwError(state, 'unknown tag !<' + state.tag + '>');
+      throwError(state, 'unknown tag !<' + state.tag + '>')
     }
 
     if (state.result !== null && type.kind !== state.kind) {
-      throwError(state, 'unacceptable node kind for !<' + state.tag + '> tag; it should be "' + type.kind + '", not "' + state.kind + '"');
+      throwError(state, 'unacceptable node kind for !<' + state.tag + '> tag; it should be "' + type.kind + '", not "' + state.kind + '"')
     }
 
     if (!type.resolve(state.result, state.tag)) { // `state.result` updated in resolver if matched
-      throwError(state, 'cannot resolve a node with !<' + state.tag + '> explicit tag');
+      throwError(state, 'cannot resolve a node with !<' + state.tag + '> explicit tag')
     } else {
-      state.result = type.construct(state.result, state.tag);
+      state.result = type.construct(state.result, state.tag)
       if (state.anchor !== null) {
-        state.anchorMap[state.anchor] = state.result;
+        storeAnchor(state, state.anchor, state.result)
       }
     }
   }
 
   if (state.listener !== null) {
-    state.listener('close', state);
+    state.listener('close', state)
   }
-  return state.tag !== null ||  state.anchor !== null || hasContent;
+
+  state.depth -= 1
+  return state.tag !== null || state.anchor !== null || hasContent
 }
 
-function readDocument(state) {
-  var documentStart = state.position,
-      _position,
-      directiveName,
-      directiveArgs,
-      hasDirectives = false,
-      ch;
+function readDocument (state) {
+  const documentStart = state.position
+  let hasDirectives = false
+  let ch
 
-  state.version = null;
-  state.checkLineBreaks = state.legacy;
-  state.tagMap = Object.create(null);
-  state.anchorMap = Object.create(null);
+  state.version = null
+  state.checkLineBreaks = state.legacy
+  state.tagMap = Object.create(null)
+  state.anchorMap = Object.create(null)
 
   while ((ch = state.input.charCodeAt(state.position)) !== 0) {
-    skipSeparationSpace(state, true, -1);
+    skipSeparationSpace(state, true, -1)
 
-    ch = state.input.charCodeAt(state.position);
+    ch = state.input.charCodeAt(state.position)
 
     if (state.lineIndent > 0 || ch !== 0x25/* % */) {
-      break;
+      break
     }
 
-    hasDirectives = true;
-    ch = state.input.charCodeAt(++state.position);
-    _position = state.position;
+    hasDirectives = true
+    ch = state.input.charCodeAt(++state.position)
+    let _position = state.position
 
-    while (ch !== 0 && !is_WS_OR_EOL(ch)) {
-      ch = state.input.charCodeAt(++state.position);
+    while (ch !== 0 && !isWsOrEol(ch)) {
+      ch = state.input.charCodeAt(++state.position)
     }
 
-    directiveName = state.input.slice(_position, state.position);
-    directiveArgs = [];
+    const directiveName = state.input.slice(_position, state.position)
+    const directiveArgs = []
 
     if (directiveName.length < 1) {
-      throwError(state, 'directive name must not be less than one character in length');
+      throwError(state, 'directive name must not be less than one character in length')
     }
 
     while (ch !== 0) {
-      while (is_WHITE_SPACE(ch)) {
-        ch = state.input.charCodeAt(++state.position);
+      while (isWhiteSpace(ch)) {
+        ch = state.input.charCodeAt(++state.position)
       }
 
       if (ch === 0x23/* # */) {
-        do { ch = state.input.charCodeAt(++state.position); }
-        while (ch !== 0 && !is_EOL(ch));
-        break;
+        do { ch = state.input.charCodeAt(++state.position) }
+        while (ch !== 0 && !isEol(ch))
+        break
       }
 
-      if (is_EOL(ch)) break;
+      if (isEol(ch)) break
 
-      _position = state.position;
+      _position = state.position
 
-      while (ch !== 0 && !is_WS_OR_EOL(ch)) {
-        ch = state.input.charCodeAt(++state.position);
+      while (ch !== 0 && !isWsOrEol(ch)) {
+        ch = state.input.charCodeAt(++state.position)
       }
 
-      directiveArgs.push(state.input.slice(_position, state.position));
+      directiveArgs.push(state.input.slice(_position, state.position))
     }
 
-    if (ch !== 0) readLineBreak(state);
+    if (ch !== 0) readLineBreak(state)
 
     if (_hasOwnProperty.call(directiveHandlers, directiveName)) {
-      directiveHandlers[directiveName](state, directiveName, directiveArgs);
+      directiveHandlers[directiveName](state, directiveName, directiveArgs)
     } else {
-      throwWarning(state, 'unknown document directive "' + directiveName + '"');
+      throwWarning(state, 'unknown document directive "' + directiveName + '"')
     }
   }
 
-  skipSeparationSpace(state, true, -1);
+  skipSeparationSpace(state, true, -1)
 
   if (state.lineIndent === 0 &&
-      state.input.charCodeAt(state.position)     === 0x2D/* - */ &&
+      state.input.charCodeAt(state.position) === 0x2D/* - */ &&
       state.input.charCodeAt(state.position + 1) === 0x2D/* - */ &&
       state.input.charCodeAt(state.position + 2) === 0x2D/* - */) {
-    state.position += 3;
-    skipSeparationSpace(state, true, -1);
-
+    state.position += 3
+    skipSeparationSpace(state, true, -1)
   } else if (hasDirectives) {
-    throwError(state, 'directives end mark is expected');
+    throwError(state, 'directives end mark is expected')
   }
 
-  composeNode(state, state.lineIndent - 1, CONTEXT_BLOCK_OUT, false, true);
-  skipSeparationSpace(state, true, -1);
+  composeNode(state, state.lineIndent - 1, CONTEXT_BLOCK_OUT, false, true)
+  skipSeparationSpace(state, true, -1)
 
   if (state.checkLineBreaks &&
       PATTERN_NON_ASCII_LINE_BREAKS.test(state.input.slice(documentStart, state.position))) {
-    throwWarning(state, 'non-ASCII line breaks are interpreted as content');
+    throwWarning(state, 'non-ASCII line breaks are interpreted as content')
   }
 
-  state.documents.push(state.result);
+  state.documents.push(state.result)
 
   if (state.position === state.lineStart && testDocumentSeparator(state)) {
-
     if (state.input.charCodeAt(state.position) === 0x2E/* . */) {
-      state.position += 3;
-      skipSeparationSpace(state, true, -1);
+      state.position += 3
+      skipSeparationSpace(state, true, -1)
     }
-    return;
+    return
   }
 
   if (state.position < (state.length - 1)) {
-    throwError(state, 'end of the stream or a document separator is expected');
-  } else {
-    return;
+    throwError(state, 'end of the stream or a document separator is expected')
   }
 }
 
-
-function loadDocuments(input, options) {
-  input = String(input);
-  options = options || {};
+function loadDocuments (input, options) {
+  input = String(input)
+  options = options || {}
 
   if (input.length !== 0) {
-
     // Add tailing `\n` if not exists
     if (input.charCodeAt(input.length - 1) !== 0x0A/* LF */ &&
         input.charCodeAt(input.length - 1) !== 0x0D/* CR */) {
-      input += '\n';
+      input += '\n'
     }
 
     // Strip BOM
     if (input.charCodeAt(0) === 0xFEFF) {
-      input = input.slice(1);
+      input = input.slice(1)
     }
   }
 
-  var state = new State(input, options);
+  const state = new State(input, options)
 
-  var nullpos = input.indexOf('\0');
+  const nullpos = input.indexOf('\0')
 
   if (nullpos !== -1) {
-    state.position = nullpos;
-    throwError(state, 'null byte is not allowed in input');
+    state.position = nullpos
+    throwError(state, 'null byte is not allowed in input')
   }
 
   // Use 0 as string terminator. That significantly simplifies bounds check.
-  state.input += '\0';
+  state.input += '\0'
 
   while (state.input.charCodeAt(state.position) === 0x20/* Space */) {
-    state.lineIndent += 1;
-    state.position += 1;
+    state.lineIndent += 1
+    state.position += 1
   }
 
   while (state.position < (state.length - 1)) {
-    readDocument(state);
+    readDocument(state)
   }
 
-  return state.documents;
+  return state.documents
 }
 
-
-function loadAll(input, iterator, options) {
+function loadAll (input, iterator, options) {
   if (iterator !== null && typeof iterator === 'object' && typeof options === 'undefined') {
-    options = iterator;
-    iterator = null;
+    options = iterator
+    iterator = null
   }
 
-  var documents = loadDocuments(input, options);
+  const documents = loadDocuments(input, options)
 
   if (typeof iterator !== 'function') {
-    return documents;
+    return documents
   }
 
-  for (var index = 0, length = documents.length; index < length; index += 1) {
-    iterator(documents[index]);
+  for (let index = 0, length = documents.length; index < length; index += 1) {
+    iterator(documents[index])
   }
 }
 
-
-function load(input, options) {
-  var documents = loadDocuments(input, options);
+function load (input, options) {
+  const documents = loadDocuments(input, options)
 
   if (documents.length === 0) {
-    /*eslint-disable no-undefined*/
-    return undefined;
+    return undefined
   } else if (documents.length === 1) {
-    return documents[0];
+    return documents[0]
   }
-  throw new YAMLException('expected a single document in the stream, but found more');
+  throw new YAMLException('expected a single document in the stream, but found more')
 }
 
-
-module.exports.loadAll = loadAll;
-module.exports.load    = load;
+module.exports.loadAll = loadAll
+module.exports.load = load
 
 
 /***/ }),
@@ -36714,125 +35142,113 @@ module.exports.load    = load;
 "use strict";
 
 
-/*eslint-disable max-len*/
+const YAMLException = __nccwpck_require__(41248)
+const Type = __nccwpck_require__(9557)
 
-var YAMLException = __nccwpck_require__(41248);
-var Type          = __nccwpck_require__(9557);
-
-
-function compileList(schema, name) {
-  var result = [];
+function compileList (schema, name) {
+  const result = []
 
   schema[name].forEach(function (currentType) {
-    var newIndex = result.length;
+    let newIndex = result.length
 
     result.forEach(function (previousType, previousIndex) {
       if (previousType.tag === currentType.tag &&
           previousType.kind === currentType.kind &&
           previousType.multi === currentType.multi) {
-
-        newIndex = previousIndex;
+        newIndex = previousIndex
       }
-    });
+    })
 
-    result[newIndex] = currentType;
-  });
+    result[newIndex] = currentType
+  })
 
-  return result;
+  return result
 }
 
-
-function compileMap(/* lists... */) {
-  var result = {
-        scalar: {},
-        sequence: {},
-        mapping: {},
-        fallback: {},
-        multi: {
-          scalar: [],
-          sequence: [],
-          mapping: [],
-          fallback: []
-        }
-      }, index, length;
-
-  function collectType(type) {
+function compileMap (/* lists... */) {
+  const result = {
+    scalar: {},
+    sequence: {},
+    mapping: {},
+    fallback: {},
+    multi: {
+      scalar: [],
+      sequence: [],
+      mapping: [],
+      fallback: []
+    }
+  }
+  function collectType (type) {
     if (type.multi) {
-      result.multi[type.kind].push(type);
-      result.multi['fallback'].push(type);
+      result.multi[type.kind].push(type)
+      result.multi['fallback'].push(type)
     } else {
-      result[type.kind][type.tag] = result['fallback'][type.tag] = type;
+      result[type.kind][type.tag] = result['fallback'][type.tag] = type
     }
   }
 
-  for (index = 0, length = arguments.length; index < length; index += 1) {
-    arguments[index].forEach(collectType);
+  for (let index = 0, length = arguments.length; index < length; index += 1) {
+    arguments[index].forEach(collectType)
   }
-  return result;
+  return result
 }
 
-
-function Schema(definition) {
-  return this.extend(definition);
+function Schema (definition) {
+  return this.extend(definition)
 }
 
-
-Schema.prototype.extend = function extend(definition) {
-  var implicit = [];
-  var explicit = [];
+Schema.prototype.extend = function extend (definition) {
+  let implicit = []
+  let explicit = []
 
   if (definition instanceof Type) {
     // Schema.extend(type)
-    explicit.push(definition);
-
+    explicit.push(definition)
   } else if (Array.isArray(definition)) {
     // Schema.extend([ type1, type2, ... ])
-    explicit = explicit.concat(definition);
-
+    explicit = explicit.concat(definition)
   } else if (definition && (Array.isArray(definition.implicit) || Array.isArray(definition.explicit))) {
     // Schema.extend({ explicit: [ type1, type2, ... ], implicit: [ type1, type2, ... ] })
-    if (definition.implicit) implicit = implicit.concat(definition.implicit);
-    if (definition.explicit) explicit = explicit.concat(definition.explicit);
-
+    if (definition.implicit) implicit = implicit.concat(definition.implicit)
+    if (definition.explicit) explicit = explicit.concat(definition.explicit)
   } else {
     throw new YAMLException('Schema.extend argument should be a Type, [ Type ], ' +
-      'or a schema definition ({ implicit: [...], explicit: [...] })');
+      'or a schema definition ({ implicit: [...], explicit: [...] })')
   }
 
   implicit.forEach(function (type) {
     if (!(type instanceof Type)) {
-      throw new YAMLException('Specified list of YAML types (or a single Type object) contains a non-Type object.');
+      throw new YAMLException('Specified list of YAML types (or a single Type object) contains a non-Type object.')
     }
 
     if (type.loadKind && type.loadKind !== 'scalar') {
-      throw new YAMLException('There is a non-scalar type in the implicit list of a schema. Implicit resolving of such types is not supported.');
+      throw new YAMLException('There is a non-scalar type in the implicit list of a schema. Implicit resolving of such types is not supported.')
     }
 
     if (type.multi) {
-      throw new YAMLException('There is a multi type in the implicit list of a schema. Multi tags can only be listed as explicit.');
+      throw new YAMLException('There is a multi type in the implicit list of a schema. Multi tags can only be listed as explicit.')
     }
-  });
+  })
 
   explicit.forEach(function (type) {
     if (!(type instanceof Type)) {
-      throw new YAMLException('Specified list of YAML types (or a single Type object) contains a non-Type object.');
+      throw new YAMLException('Specified list of YAML types (or a single Type object) contains a non-Type object.')
     }
-  });
+  })
 
-  var result = Object.create(Schema.prototype);
+  const result = Object.create(Schema.prototype)
 
-  result.implicit = (this.implicit || []).concat(implicit);
-  result.explicit = (this.explicit || []).concat(explicit);
+  result.implicit = (this.implicit || []).concat(implicit)
+  result.explicit = (this.explicit || []).concat(explicit)
 
-  result.compiledImplicit = compileList(result, 'implicit');
-  result.compiledExplicit = compileList(result, 'explicit');
-  result.compiledTypeMap  = compileMap(result.compiledImplicit, result.compiledExplicit);
+  result.compiledImplicit = compileList(result, 'implicit')
+  result.compiledExplicit = compileList(result, 'explicit')
+  result.compiledTypeMap = compileMap(result.compiledImplicit, result.compiledExplicit)
 
-  return result;
-};
+  return result
+}
 
-
-module.exports = Schema;
+module.exports = Schema
 
 
 /***/ }),
@@ -36849,9 +35265,7 @@ module.exports = Schema;
 
 
 
-
-
-module.exports = __nccwpck_require__(58927);
+module.exports = __nccwpck_require__(58927)
 
 
 /***/ }),
@@ -36868,8 +35282,6 @@ module.exports = __nccwpck_require__(58927);
 
 
 
-
-
 module.exports = (__nccwpck_require__(55746).extend)({
   implicit: [
     __nccwpck_require__(28966),
@@ -36881,7 +35293,7 @@ module.exports = (__nccwpck_require__(55746).extend)({
     __nccwpck_require__(16267),
     __nccwpck_require__(78758)
   ]
-});
+})
 
 
 /***/ }),
@@ -36895,10 +35307,7 @@ module.exports = (__nccwpck_require__(55746).extend)({
 
 
 
-
-
-var Schema = __nccwpck_require__(62046);
-
+const Schema = __nccwpck_require__(62046)
 
 module.exports = new Schema({
   explicit: [
@@ -36906,7 +35315,7 @@ module.exports = new Schema({
     __nccwpck_require__(77161),
     __nccwpck_require__(47316)
   ]
-});
+})
 
 
 /***/ }),
@@ -36924,8 +35333,6 @@ module.exports = new Schema({
 
 
 
-
-
 module.exports = (__nccwpck_require__(69832).extend)({
   implicit: [
     __nccwpck_require__(4333),
@@ -36933,7 +35340,7 @@ module.exports = (__nccwpck_require__(69832).extend)({
     __nccwpck_require__(84652),
     __nccwpck_require__(57584)
   ]
-});
+})
 
 
 /***/ }),
@@ -36944,105 +35351,100 @@ module.exports = (__nccwpck_require__(69832).extend)({
 "use strict";
 
 
-
-var common = __nccwpck_require__(19816);
-
+const common = __nccwpck_require__(19816)
 
 // get snippet for a single line, respecting maxLength
-function getLine(buffer, lineStart, lineEnd, position, maxLineLength) {
-  var head = '';
-  var tail = '';
-  var maxHalfLength = Math.floor(maxLineLength / 2) - 1;
+function getLine (buffer, lineStart, lineEnd, position, maxLineLength) {
+  let head = ''
+  let tail = ''
+  const maxHalfLength = Math.floor(maxLineLength / 2) - 1
 
   if (position - lineStart > maxHalfLength) {
-    head = ' ... ';
-    lineStart = position - maxHalfLength + head.length;
+    head = ' ... '
+    lineStart = position - maxHalfLength + head.length
   }
 
   if (lineEnd - position > maxHalfLength) {
-    tail = ' ...';
-    lineEnd = position + maxHalfLength - tail.length;
+    tail = ' ...'
+    lineEnd = position + maxHalfLength - tail.length
   }
 
   return {
     str: head + buffer.slice(lineStart, lineEnd).replace(/\t/g, '→') + tail,
     pos: position - lineStart + head.length // relative position
-  };
+  }
 }
 
-
-function padStart(string, max) {
-  return common.repeat(' ', max - string.length) + string;
+function padStart (string, max) {
+  return common.repeat(' ', max - string.length) + string
 }
 
+function makeSnippet (mark, options) {
+  options = Object.create(options || null)
 
-function makeSnippet(mark, options) {
-  options = Object.create(options || null);
+  if (!mark.buffer) return null
 
-  if (!mark.buffer) return null;
+  if (!options.maxLength) options.maxLength = 79
+  if (typeof options.indent !== 'number') options.indent = 1
+  if (typeof options.linesBefore !== 'number') options.linesBefore = 3
+  if (typeof options.linesAfter !== 'number') options.linesAfter = 2
 
-  if (!options.maxLength) options.maxLength = 79;
-  if (typeof options.indent      !== 'number') options.indent      = 1;
-  if (typeof options.linesBefore !== 'number') options.linesBefore = 3;
-  if (typeof options.linesAfter  !== 'number') options.linesAfter  = 2;
-
-  var re = /\r?\n|\r|\0/g;
-  var lineStarts = [ 0 ];
-  var lineEnds = [];
-  var match;
-  var foundLineNo = -1;
+  const re = /\r?\n|\r|\0/g
+  const lineStarts = [0]
+  const lineEnds = []
+  let match
+  let foundLineNo = -1
 
   while ((match = re.exec(mark.buffer))) {
-    lineEnds.push(match.index);
-    lineStarts.push(match.index + match[0].length);
+    lineEnds.push(match.index)
+    lineStarts.push(match.index + match[0].length)
 
     if (mark.position <= match.index && foundLineNo < 0) {
-      foundLineNo = lineStarts.length - 2;
+      foundLineNo = lineStarts.length - 2
     }
   }
 
-  if (foundLineNo < 0) foundLineNo = lineStarts.length - 1;
+  if (foundLineNo < 0) foundLineNo = lineStarts.length - 1
 
-  var result = '', i, line;
-  var lineNoLength = Math.min(mark.line + options.linesAfter, lineEnds.length).toString().length;
-  var maxLineLength = options.maxLength - (options.indent + lineNoLength + 3);
+  let result = ''
+  const lineNoLength = Math.min(mark.line + options.linesAfter, lineEnds.length).toString().length
+  const maxLineLength = options.maxLength - (options.indent + lineNoLength + 3)
 
-  for (i = 1; i <= options.linesBefore; i++) {
-    if (foundLineNo - i < 0) break;
-    line = getLine(
+  for (let i = 1; i <= options.linesBefore; i++) {
+    if (foundLineNo - i < 0) break
+    const line = getLine(
       mark.buffer,
       lineStarts[foundLineNo - i],
       lineEnds[foundLineNo - i],
       mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo - i]),
       maxLineLength
-    );
+    )
     result = common.repeat(' ', options.indent) + padStart((mark.line - i + 1).toString(), lineNoLength) +
-      ' | ' + line.str + '\n' + result;
+      ' | ' + line.str + '\n' + result
   }
 
-  line = getLine(mark.buffer, lineStarts[foundLineNo], lineEnds[foundLineNo], mark.position, maxLineLength);
+  const line = getLine(mark.buffer, lineStarts[foundLineNo], lineEnds[foundLineNo], mark.position, maxLineLength)
   result += common.repeat(' ', options.indent) + padStart((mark.line + 1).toString(), lineNoLength) +
-    ' | ' + line.str + '\n';
-  result += common.repeat('-', options.indent + lineNoLength + 3 + line.pos) + '^' + '\n';
+    ' | ' + line.str + '\n'
+  result += common.repeat('-', options.indent + lineNoLength + 3 + line.pos) + '^' + '\n'
 
-  for (i = 1; i <= options.linesAfter; i++) {
-    if (foundLineNo + i >= lineEnds.length) break;
-    line = getLine(
+  for (let i = 1; i <= options.linesAfter; i++) {
+    if (foundLineNo + i >= lineEnds.length) break
+    const line = getLine(
       mark.buffer,
       lineStarts[foundLineNo + i],
       lineEnds[foundLineNo + i],
       mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo + i]),
       maxLineLength
-    );
+    )
     result += common.repeat(' ', options.indent) + padStart((mark.line + i + 1).toString(), lineNoLength) +
-      ' | ' + line.str + '\n';
+      ' | ' + line.str + '\n'
   }
 
-  return result.replace(/\n$/, '');
+  return result.replace(/\n$/, '')
 }
 
-
-module.exports = makeSnippet;
+module.exports = makeSnippet
 
 
 /***/ }),
@@ -37053,9 +35455,9 @@ module.exports = makeSnippet;
 "use strict";
 
 
-var YAMLException = __nccwpck_require__(41248);
+const YAMLException = __nccwpck_require__(41248)
 
-var TYPE_CONSTRUCTOR_OPTIONS = [
+const TYPE_CONSTRUCTOR_OPTIONS = [
   'kind',
   'multi',
   'resolve',
@@ -37066,57 +35468,57 @@ var TYPE_CONSTRUCTOR_OPTIONS = [
   'representName',
   'defaultStyle',
   'styleAliases'
-];
+]
 
-var YAML_NODE_KINDS = [
+const YAML_NODE_KINDS = [
   'scalar',
   'sequence',
   'mapping'
-];
+]
 
-function compileStyleAliases(map) {
-  var result = {};
+function compileStyleAliases (map) {
+  const result = {}
 
   if (map !== null) {
     Object.keys(map).forEach(function (style) {
       map[style].forEach(function (alias) {
-        result[String(alias)] = style;
-      });
-    });
+        result[String(alias)] = style
+      })
+    })
   }
 
-  return result;
+  return result
 }
 
-function Type(tag, options) {
-  options = options || {};
+function Type (tag, options) {
+  options = options || {}
 
   Object.keys(options).forEach(function (name) {
     if (TYPE_CONSTRUCTOR_OPTIONS.indexOf(name) === -1) {
-      throw new YAMLException('Unknown option "' + name + '" is met in definition of "' + tag + '" YAML type.');
+      throw new YAMLException('Unknown option "' + name + '" is met in definition of "' + tag + '" YAML type.')
     }
-  });
+  })
 
   // TODO: Add tag format check.
-  this.options       = options; // keep original options in case user wants to extend this type later
-  this.tag           = tag;
-  this.kind          = options['kind']          || null;
-  this.resolve       = options['resolve']       || function () { return true; };
-  this.construct     = options['construct']     || function (data) { return data; };
-  this.instanceOf    = options['instanceOf']    || null;
-  this.predicate     = options['predicate']     || null;
-  this.represent     = options['represent']     || null;
-  this.representName = options['representName'] || null;
-  this.defaultStyle  = options['defaultStyle']  || null;
-  this.multi         = options['multi']         || false;
-  this.styleAliases  = compileStyleAliases(options['styleAliases'] || null);
+  this.options = options // keep original options in case user wants to extend this type later
+  this.tag = tag
+  this.kind = options['kind'] || null
+  this.resolve = options['resolve'] || function () { return true }
+  this.construct = options['construct'] || function (data) { return data }
+  this.instanceOf = options['instanceOf'] || null
+  this.predicate = options['predicate'] || null
+  this.represent = options['represent'] || null
+  this.representName = options['representName'] || null
+  this.defaultStyle = options['defaultStyle'] || null
+  this.multi = options['multi'] || false
+  this.styleAliases = compileStyleAliases(options['styleAliases'] || null)
 
   if (YAML_NODE_KINDS.indexOf(this.kind) === -1) {
-    throw new YAMLException('Unknown kind "' + this.kind + '" is specified for "' + tag + '" YAML type.');
+    throw new YAMLException('Unknown kind "' + this.kind + '" is specified for "' + tag + '" YAML type.')
   }
 }
 
-module.exports = Type;
+module.exports = Type
 
 
 /***/ }),
@@ -37127,120 +35529,117 @@ module.exports = Type;
 "use strict";
 
 
-/*eslint-disable no-bitwise*/
-
-
-var Type = __nccwpck_require__(9557);
-
+const Type = __nccwpck_require__(9557)
 
 // [ 64, 65, 66 ] -> [ padding, CR, LF ]
-var BASE64_MAP = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r';
+const BASE64_MAP = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r'
 
+function resolveYamlBinary (data) {
+  if (data === null) return false
 
-function resolveYamlBinary(data) {
-  if (data === null) return false;
-
-  var code, idx, bitlen = 0, max = data.length, map = BASE64_MAP;
+  let bitlen = 0
+  const max = data.length
+  const map = BASE64_MAP
 
   // Convert one by one.
-  for (idx = 0; idx < max; idx++) {
-    code = map.indexOf(data.charAt(idx));
+  for (let idx = 0; idx < max; idx++) {
+    const code = map.indexOf(data.charAt(idx))
 
     // Skip CR/LF
-    if (code > 64) continue;
+    if (code > 64) continue
 
     // Fail on illegal characters
-    if (code < 0) return false;
+    if (code < 0) return false
 
-    bitlen += 6;
+    bitlen += 6
   }
 
   // If there are any bits left, source was corrupted
-  return (bitlen % 8) === 0;
+  return (bitlen % 8) === 0
 }
 
-function constructYamlBinary(data) {
-  var idx, tailbits,
-      input = data.replace(/[\r\n=]/g, ''), // remove CR/LF & padding to simplify scan
-      max = input.length,
-      map = BASE64_MAP,
-      bits = 0,
-      result = [];
+function constructYamlBinary (data) {
+  const input = data.replace(/[\r\n=]/g, '') // remove CR/LF & padding to simplify scan
+  const max = input.length
+  const map = BASE64_MAP
+  let bits = 0
+  const result = []
 
   // Collect by 6*4 bits (3 bytes)
 
-  for (idx = 0; idx < max; idx++) {
+  for (let idx = 0; idx < max; idx++) {
     if ((idx % 4 === 0) && idx) {
-      result.push((bits >> 16) & 0xFF);
-      result.push((bits >> 8) & 0xFF);
-      result.push(bits & 0xFF);
+      result.push((bits >> 16) & 0xFF)
+      result.push((bits >> 8) & 0xFF)
+      result.push(bits & 0xFF)
     }
 
-    bits = (bits << 6) | map.indexOf(input.charAt(idx));
+    bits = (bits << 6) | map.indexOf(input.charAt(idx))
   }
 
   // Dump tail
 
-  tailbits = (max % 4) * 6;
+  const tailbits = (max % 4) * 6
 
   if (tailbits === 0) {
-    result.push((bits >> 16) & 0xFF);
-    result.push((bits >> 8) & 0xFF);
-    result.push(bits & 0xFF);
+    result.push((bits >> 16) & 0xFF)
+    result.push((bits >> 8) & 0xFF)
+    result.push(bits & 0xFF)
   } else if (tailbits === 18) {
-    result.push((bits >> 10) & 0xFF);
-    result.push((bits >> 2) & 0xFF);
+    result.push((bits >> 10) & 0xFF)
+    result.push((bits >> 2) & 0xFF)
   } else if (tailbits === 12) {
-    result.push((bits >> 4) & 0xFF);
+    result.push((bits >> 4) & 0xFF)
   }
 
-  return new Uint8Array(result);
+  return new Uint8Array(result)
 }
 
-function representYamlBinary(object /*, style*/) {
-  var result = '', bits = 0, idx, tail,
-      max = object.length,
-      map = BASE64_MAP;
+function representYamlBinary (object /*, style */) {
+  let result = ''
+  let bits = 0
+  const max = object.length
+  const map = BASE64_MAP
 
   // Convert every three bytes to 4 ASCII characters.
 
-  for (idx = 0; idx < max; idx++) {
+  for (let idx = 0; idx < max; idx++) {
     if ((idx % 3 === 0) && idx) {
-      result += map[(bits >> 18) & 0x3F];
-      result += map[(bits >> 12) & 0x3F];
-      result += map[(bits >> 6) & 0x3F];
-      result += map[bits & 0x3F];
+      result += map[(bits >> 18) & 0x3F]
+      result += map[(bits >> 12) & 0x3F]
+      result += map[(bits >> 6) & 0x3F]
+      result += map[bits & 0x3F]
     }
 
-    bits = (bits << 8) + object[idx];
+    bits = (bits << 8) + object[idx]
   }
 
   // Dump tail
 
-  tail = max % 3;
+  const tail = max % 3
 
   if (tail === 0) {
-    result += map[(bits >> 18) & 0x3F];
-    result += map[(bits >> 12) & 0x3F];
-    result += map[(bits >> 6) & 0x3F];
-    result += map[bits & 0x3F];
+    result += map[(bits >> 18) & 0x3F]
+    result += map[(bits >> 12) & 0x3F]
+    result += map[(bits >> 6) & 0x3F]
+    result += map[bits & 0x3F]
   } else if (tail === 2) {
-    result += map[(bits >> 10) & 0x3F];
-    result += map[(bits >> 4) & 0x3F];
-    result += map[(bits << 2) & 0x3F];
-    result += map[64];
+    result += map[(bits >> 10) & 0x3F]
+    result += map[(bits >> 4) & 0x3F]
+    result += map[(bits << 2) & 0x3F]
+    result += map[64]
   } else if (tail === 1) {
-    result += map[(bits >> 2) & 0x3F];
-    result += map[(bits << 4) & 0x3F];
-    result += map[64];
-    result += map[64];
+    result += map[(bits >> 2) & 0x3F]
+    result += map[(bits << 4) & 0x3F]
+    result += map[64]
+    result += map[64]
   }
 
-  return result;
+  return result
 }
 
-function isBinary(obj) {
-  return Object.prototype.toString.call(obj) ===  '[object Uint8Array]';
+function isBinary (obj) {
+  return Object.prototype.toString.call(obj) === '[object Uint8Array]'
 }
 
 module.exports = new Type('tag:yaml.org,2002:binary', {
@@ -37249,7 +35648,7 @@ module.exports = new Type('tag:yaml.org,2002:binary', {
   construct: constructYamlBinary,
   predicate: isBinary,
   represent: representYamlBinary
-});
+})
 
 
 /***/ }),
@@ -37260,25 +35659,25 @@ module.exports = new Type('tag:yaml.org,2002:binary', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
-function resolveYamlBoolean(data) {
-  if (data === null) return false;
+function resolveYamlBoolean (data) {
+  if (data === null) return false
 
-  var max = data.length;
+  const max = data.length
 
   return (max === 4 && (data === 'true' || data === 'True' || data === 'TRUE')) ||
-         (max === 5 && (data === 'false' || data === 'False' || data === 'FALSE'));
+         (max === 5 && (data === 'false' || data === 'False' || data === 'FALSE'))
 }
 
-function constructYamlBoolean(data) {
+function constructYamlBoolean (data) {
   return data === 'true' ||
          data === 'True' ||
-         data === 'TRUE';
+         data === 'TRUE'
 }
 
-function isBoolean(object) {
-  return Object.prototype.toString.call(object) === '[object Boolean]';
+function isBoolean (object) {
+  return Object.prototype.toString.call(object) === '[object Boolean]'
 }
 
 module.exports = new Type('tag:yaml.org,2002:bool', {
@@ -37287,12 +35686,12 @@ module.exports = new Type('tag:yaml.org,2002:bool', {
   construct: constructYamlBoolean,
   predicate: isBoolean,
   represent: {
-    lowercase: function (object) { return object ? 'true' : 'false'; },
-    uppercase: function (object) { return object ? 'TRUE' : 'FALSE'; },
-    camelcase: function (object) { return object ? 'True' : 'False'; }
+    lowercase: function (object) { return object ? 'true' : 'false' },
+    uppercase: function (object) { return object ? 'TRUE' : 'FALSE' },
+    camelcase: function (object) { return object ? 'True' : 'False' }
   },
   defaultStyle: 'lowercase'
-});
+})
 
 
 /***/ }),
@@ -37303,91 +35702,93 @@ module.exports = new Type('tag:yaml.org,2002:bool', {
 "use strict";
 
 
-var common = __nccwpck_require__(19816);
-var Type   = __nccwpck_require__(9557);
+const common = __nccwpck_require__(19816)
+const Type = __nccwpck_require__(9557)
 
-var YAML_FLOAT_PATTERN = new RegExp(
+const YAML_FLOAT_PATTERN = new RegExp(
   // 2.5e4, 2.5 and integers
-  '^(?:[-+]?(?:[0-9][0-9_]*)(?:\\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?' +
+  '^(?:[-+]?(?:[0-9]+)(?:\\.[0-9]*)?(?:[eE][-+]?[0-9]+)?' +
   // .2e4, .2
   // special case, seems not from spec
-  '|\\.[0-9_]+(?:[eE][-+]?[0-9]+)?' +
+  '|\\.[0-9]+(?:[eE][-+]?[0-9]+)?' +
   // .inf
   '|[-+]?\\.(?:inf|Inf|INF)' +
   // .nan
-  '|\\.(?:nan|NaN|NAN))$');
+  '|\\.(?:nan|NaN|NAN))$')
 
-function resolveYamlFloat(data) {
-  if (data === null) return false;
+const YAML_FLOAT_SPECIAL_PATTERN = new RegExp(
+  '^(?:' +
+  // .inf
+  '[-+]?\\.(?:inf|Inf|INF)' +
+  // .nan
+  '|\\.(?:nan|NaN|NAN))$')
 
-  if (!YAML_FLOAT_PATTERN.test(data) ||
-      // Quick hack to not allow integers end with `_`
-      // Probably should update regexp & check speed
-      data[data.length - 1] === '_') {
-    return false;
+function resolveYamlFloat (data) {
+  if (data === null) return false
+
+  if (!YAML_FLOAT_PATTERN.test(data)) {
+    return false
   }
 
-  return true;
+  if (isFinite(parseFloat(data, 10))) {
+    return true
+  }
+
+  return YAML_FLOAT_SPECIAL_PATTERN.test(data)
 }
 
-function constructYamlFloat(data) {
-  var value, sign;
-
-  value  = data.replace(/_/g, '').toLowerCase();
-  sign   = value[0] === '-' ? -1 : 1;
+function constructYamlFloat (data) {
+  let value = data.toLowerCase()
+  const sign = value[0] === '-' ? -1 : 1
 
   if ('+-'.indexOf(value[0]) >= 0) {
-    value = value.slice(1);
+    value = value.slice(1)
   }
 
   if (value === '.inf') {
-    return (sign === 1) ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
-
+    return (sign === 1) ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
   } else if (value === '.nan') {
-    return NaN;
+    return NaN
   }
-  return sign * parseFloat(value, 10);
+  return sign * parseFloat(value, 10)
 }
 
+const SCIENTIFIC_WITHOUT_DOT = /^[-+]?[0-9]+e/
 
-var SCIENTIFIC_WITHOUT_DOT = /^[-+]?[0-9]+e/;
-
-function representYamlFloat(object, style) {
-  var res;
-
+function representYamlFloat (object, style) {
   if (isNaN(object)) {
     switch (style) {
-      case 'lowercase': return '.nan';
-      case 'uppercase': return '.NAN';
-      case 'camelcase': return '.NaN';
+      case 'lowercase': return '.nan'
+      case 'uppercase': return '.NAN'
+      case 'camelcase': return '.NaN'
     }
   } else if (Number.POSITIVE_INFINITY === object) {
     switch (style) {
-      case 'lowercase': return '.inf';
-      case 'uppercase': return '.INF';
-      case 'camelcase': return '.Inf';
+      case 'lowercase': return '.inf'
+      case 'uppercase': return '.INF'
+      case 'camelcase': return '.Inf'
     }
   } else if (Number.NEGATIVE_INFINITY === object) {
     switch (style) {
-      case 'lowercase': return '-.inf';
-      case 'uppercase': return '-.INF';
-      case 'camelcase': return '-.Inf';
+      case 'lowercase': return '-.inf'
+      case 'uppercase': return '-.INF'
+      case 'camelcase': return '-.Inf'
     }
   } else if (common.isNegativeZero(object)) {
-    return '-0.0';
+    return '-0.0'
   }
 
-  res = object.toString(10);
+  const res = object.toString(10)
 
   // JS stringifier can build scientific format without dots: 5e-100,
   // while YAML requres dot: 5.e-100. Fix it with simple hack
 
-  return SCIENTIFIC_WITHOUT_DOT.test(res) ? res.replace('e', '.e') : res;
+  return SCIENTIFIC_WITHOUT_DOT.test(res) ? res.replace('e', '.e') : res
 }
 
-function isFloat(object) {
+function isFloat (object) {
   return (Object.prototype.toString.call(object) === '[object Number]') &&
-         (object % 1 !== 0 || common.isNegativeZero(object));
+         (object % 1 !== 0 || common.isNegativeZero(object))
 }
 
 module.exports = new Type('tag:yaml.org,2002:float', {
@@ -37397,7 +35798,7 @@ module.exports = new Type('tag:yaml.org,2002:float', {
   predicate: isFloat,
   represent: representYamlFloat,
   defaultStyle: 'lowercase'
-});
+})
 
 
 /***/ }),
@@ -37408,138 +35809,125 @@ module.exports = new Type('tag:yaml.org,2002:float', {
 "use strict";
 
 
-var common = __nccwpck_require__(19816);
-var Type   = __nccwpck_require__(9557);
+const common = __nccwpck_require__(19816)
+const Type = __nccwpck_require__(9557)
 
-function isHexCode(c) {
-  return ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */)) ||
-         ((0x41/* A */ <= c) && (c <= 0x46/* F */)) ||
-         ((0x61/* a */ <= c) && (c <= 0x66/* f */));
+function isHexCode (c) {
+  return ((c >= 0x30/* 0 */) && (c <= 0x39/* 9 */)) ||
+         ((c >= 0x41/* A */) && (c <= 0x46/* F */)) ||
+         ((c >= 0x61/* a */) && (c <= 0x66/* f */))
 }
 
-function isOctCode(c) {
-  return ((0x30/* 0 */ <= c) && (c <= 0x37/* 7 */));
+function isOctCode (c) {
+  return ((c >= 0x30/* 0 */) && (c <= 0x37/* 7 */))
 }
 
-function isDecCode(c) {
-  return ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */));
+function isDecCode (c) {
+  return ((c >= 0x30/* 0 */) && (c <= 0x39/* 9 */))
 }
 
-function resolveYamlInteger(data) {
-  if (data === null) return false;
+function resolveYamlInteger (data) {
+  if (data === null) return false
 
-  var max = data.length,
-      index = 0,
-      hasDigits = false,
-      ch;
+  const max = data.length
+  let index = 0
+  let hasDigits = false
 
-  if (!max) return false;
+  if (!max) return false
 
-  ch = data[index];
+  let ch = data[index]
 
   // sign
   if (ch === '-' || ch === '+') {
-    ch = data[++index];
+    ch = data[++index]
   }
 
   if (ch === '0') {
     // 0
-    if (index + 1 === max) return true;
-    ch = data[++index];
+    if (index + 1 === max) return true
+    ch = data[++index]
 
     // base 2, base 8, base 16
 
     if (ch === 'b') {
       // base 2
-      index++;
+      index++
 
       for (; index < max; index++) {
-        ch = data[index];
-        if (ch === '_') continue;
-        if (ch !== '0' && ch !== '1') return false;
-        hasDigits = true;
+        ch = data[index]
+        if (ch !== '0' && ch !== '1') return false
+        hasDigits = true
       }
-      return hasDigits && ch !== '_';
+      return hasDigits && isFinite(parseYamlInteger(data))
     }
-
 
     if (ch === 'x') {
       // base 16
-      index++;
+      index++
 
       for (; index < max; index++) {
-        ch = data[index];
-        if (ch === '_') continue;
-        if (!isHexCode(data.charCodeAt(index))) return false;
-        hasDigits = true;
+        if (!isHexCode(data.charCodeAt(index))) return false
+        hasDigits = true
       }
-      return hasDigits && ch !== '_';
+      return hasDigits && isFinite(parseYamlInteger(data))
     }
-
 
     if (ch === 'o') {
       // base 8
-      index++;
+      index++
 
       for (; index < max; index++) {
-        ch = data[index];
-        if (ch === '_') continue;
-        if (!isOctCode(data.charCodeAt(index))) return false;
-        hasDigits = true;
+        if (!isOctCode(data.charCodeAt(index))) return false
+        hasDigits = true
       }
-      return hasDigits && ch !== '_';
+      return hasDigits && isFinite(parseYamlInteger(data))
     }
   }
 
   // base 10 (except 0)
 
-  // value should not start with `_`;
-  if (ch === '_') return false;
-
   for (; index < max; index++) {
-    ch = data[index];
-    if (ch === '_') continue;
     if (!isDecCode(data.charCodeAt(index))) {
-      return false;
+      return false
     }
-    hasDigits = true;
+    hasDigits = true
   }
 
-  // Should have digits and should not end with `_`
-  if (!hasDigits || ch === '_') return false;
+  if (!hasDigits) return false
 
-  return true;
+  return isFinite(parseYamlInteger(data))
 }
 
-function constructYamlInteger(data) {
-  var value = data, sign = 1, ch;
+function parseYamlInteger (data) {
+  let value = data
+  let sign = 1
 
-  if (value.indexOf('_') !== -1) {
-    value = value.replace(/_/g, '');
-  }
-
-  ch = value[0];
+  let ch = value[0]
 
   if (ch === '-' || ch === '+') {
-    if (ch === '-') sign = -1;
-    value = value.slice(1);
-    ch = value[0];
+    if (ch === '-') sign = -1
+    value = value.slice(1)
+    ch = value[0]
   }
 
-  if (value === '0') return 0;
+  if (value === '0') return 0
 
   if (ch === '0') {
-    if (value[1] === 'b') return sign * parseInt(value.slice(2), 2);
-    if (value[1] === 'x') return sign * parseInt(value.slice(2), 16);
-    if (value[1] === 'o') return sign * parseInt(value.slice(2), 8);
+    if (value[1] === 'b') return sign * parseInt(value.slice(2), 2)
+    if (value[1] === 'x') return sign * parseInt(value.slice(2), 16)
+    if (value[1] === 'o') return sign * parseInt(value.slice(2), 8)
   }
 
-  return sign * parseInt(value, 10);
+  return sign * parseInt(value, 10)
 }
 
-function isInteger(object) {
+function constructYamlInteger (data) {
+  return parseYamlInteger(data)
+}
+
+function isInteger (object) {
   return (Object.prototype.toString.call(object)) === '[object Number]' &&
-         (object % 1 === 0 && !common.isNegativeZero(object));
+         (object % 1 === 0 && !common.isNegativeZero(object))
 }
 
 module.exports = new Type('tag:yaml.org,2002:int', {
@@ -37548,20 +35936,19 @@ module.exports = new Type('tag:yaml.org,2002:int', {
   construct: constructYamlInteger,
   predicate: isInteger,
   represent: {
-    binary:      function (obj) { return obj >= 0 ? '0b' + obj.toString(2) : '-0b' + obj.toString(2).slice(1); },
-    octal:       function (obj) { return obj >= 0 ? '0o'  + obj.toString(8) : '-0o'  + obj.toString(8).slice(1); },
-    decimal:     function (obj) { return obj.toString(10); },
-    /* eslint-disable max-len */
-    hexadecimal: function (obj) { return obj >= 0 ? '0x' + obj.toString(16).toUpperCase() :  '-0x' + obj.toString(16).toUpperCase().slice(1); }
+    binary: function (obj) { return obj >= 0 ? '0b' + obj.toString(2) : '-0b' + obj.toString(2).slice(1) },
+    octal: function (obj) { return obj >= 0 ? '0o' + obj.toString(8) : '-0o' + obj.toString(8).slice(1) },
+    decimal: function (obj) { return obj.toString(10) },
+    hexadecimal: function (obj) { return obj >= 0 ? '0x' + obj.toString(16).toUpperCase() : '-0x' + obj.toString(16).toUpperCase().slice(1) }
   },
   defaultStyle: 'decimal',
   styleAliases: {
-    binary:      [ 2,  'bin' ],
-    octal:       [ 8,  'oct' ],
-    decimal:     [ 10, 'dec' ],
-    hexadecimal: [ 16, 'hex' ]
+    binary: [2, 'bin'],
+    octal: [8, 'oct'],
+    decimal: [10, 'dec'],
+    hexadecimal: [16, 'hex']
   }
-});
+})
 
 
 /***/ }),
@@ -37572,12 +35959,12 @@ module.exports = new Type('tag:yaml.org,2002:int', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
 module.exports = new Type('tag:yaml.org,2002:map', {
   kind: 'mapping',
-  construct: function (data) { return data !== null ? data : {}; }
-});
+  construct: function (data) { return data !== null ? data : {} }
+})
 
 
 /***/ }),
@@ -37588,16 +35975,16 @@ module.exports = new Type('tag:yaml.org,2002:map', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
-function resolveYamlMerge(data) {
-  return data === '<<' || data === null;
+function resolveYamlMerge (data) {
+  return data === '<<' || data === null
 }
 
 module.exports = new Type('tag:yaml.org,2002:merge', {
   kind: 'scalar',
   resolve: resolveYamlMerge
-});
+})
 
 
 /***/ }),
@@ -37608,23 +35995,23 @@ module.exports = new Type('tag:yaml.org,2002:merge', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
-function resolveYamlNull(data) {
-  if (data === null) return true;
+function resolveYamlNull (data) {
+  if (data === null) return true
 
-  var max = data.length;
+  const max = data.length
 
   return (max === 1 && data === '~') ||
-         (max === 4 && (data === 'null' || data === 'Null' || data === 'NULL'));
+         (max === 4 && (data === 'null' || data === 'Null' || data === 'NULL'))
 }
 
-function constructYamlNull() {
-  return null;
+function constructYamlNull () {
+  return null
 }
 
-function isNull(object) {
-  return object === null;
+function isNull (object) {
+  return object === null
 }
 
 module.exports = new Type('tag:yaml.org,2002:null', {
@@ -37633,14 +36020,14 @@ module.exports = new Type('tag:yaml.org,2002:null', {
   construct: constructYamlNull,
   predicate: isNull,
   represent: {
-    canonical: function () { return '~';    },
-    lowercase: function () { return 'null'; },
-    uppercase: function () { return 'NULL'; },
-    camelcase: function () { return 'Null'; },
-    empty:     function () { return '';     }
+    canonical: function () { return '~' },
+    lowercase: function () { return 'null' },
+    uppercase: function () { return 'NULL' },
+    camelcase: function () { return 'Null' },
+    empty: function () { return '' }
   },
   defaultStyle: 'lowercase'
-});
+})
 
 
 /***/ }),
@@ -37651,48 +36038,49 @@ module.exports = new Type('tag:yaml.org,2002:null', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
-var _hasOwnProperty = Object.prototype.hasOwnProperty;
-var _toString       = Object.prototype.toString;
+const _hasOwnProperty = Object.prototype.hasOwnProperty
+const _toString = Object.prototype.toString
 
-function resolveYamlOmap(data) {
-  if (data === null) return true;
+function resolveYamlOmap (data) {
+  if (data === null) return true
 
-  var objectKeys = [], index, length, pair, pairKey, pairHasKey,
-      object = data;
+  const objectKeys = {}
+  const object = data
 
-  for (index = 0, length = object.length; index < length; index += 1) {
-    pair = object[index];
-    pairHasKey = false;
+  for (let index = 0, length = object.length; index < length; index += 1) {
+    const pair = object[index]
+    let pairHasKey = false
 
-    if (_toString.call(pair) !== '[object Object]') return false;
+    if (_toString.call(pair) !== '[object Object]') return false
 
+    let pairKey
     for (pairKey in pair) {
       if (_hasOwnProperty.call(pair, pairKey)) {
-        if (!pairHasKey) pairHasKey = true;
-        else return false;
+        if (!pairHasKey) pairHasKey = true
+        else return false
       }
     }
 
-    if (!pairHasKey) return false;
+    if (!pairHasKey) return false
 
-    if (objectKeys.indexOf(pairKey) === -1) objectKeys.push(pairKey);
-    else return false;
+    if (_hasOwnProperty.call(objectKeys, pairKey)) return false
+    Object.defineProperty(objectKeys, pairKey, { value: true })
   }
 
-  return true;
+  return true
 }
 
-function constructYamlOmap(data) {
-  return data !== null ? data : [];
+function constructYamlOmap (data) {
+  return data !== null ? data : []
 }
 
 module.exports = new Type('tag:yaml.org,2002:omap', {
   kind: 'sequence',
   resolve: resolveYamlOmap,
   construct: constructYamlOmap
-});
+})
 
 
 /***/ }),
@@ -37703,57 +36091,54 @@ module.exports = new Type('tag:yaml.org,2002:omap', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
-var _toString = Object.prototype.toString;
+const _toString = Object.prototype.toString
 
-function resolveYamlPairs(data) {
-  if (data === null) return true;
+function resolveYamlPairs (data) {
+  if (data === null) return true
 
-  var index, length, pair, keys, result,
-      object = data;
+  const object = data
 
-  result = new Array(object.length);
+  const result = new Array(object.length)
 
-  for (index = 0, length = object.length; index < length; index += 1) {
-    pair = object[index];
+  for (let index = 0, length = object.length; index < length; index += 1) {
+    const pair = object[index]
 
-    if (_toString.call(pair) !== '[object Object]') return false;
+    if (_toString.call(pair) !== '[object Object]') return false
 
-    keys = Object.keys(pair);
+    const keys = Object.keys(pair)
 
-    if (keys.length !== 1) return false;
+    if (keys.length !== 1) return false
 
-    result[index] = [ keys[0], pair[keys[0]] ];
+    result[index] = [keys[0], pair[keys[0]]]
   }
 
-  return true;
+  return true
 }
 
-function constructYamlPairs(data) {
-  if (data === null) return [];
+function constructYamlPairs (data) {
+  if (data === null) return []
 
-  var index, length, pair, keys, result,
-      object = data;
+  const object = data
+  const result = new Array(object.length)
 
-  result = new Array(object.length);
+  for (let index = 0, length = object.length; index < length; index += 1) {
+    const pair = object[index]
 
-  for (index = 0, length = object.length; index < length; index += 1) {
-    pair = object[index];
+    const keys = Object.keys(pair)
 
-    keys = Object.keys(pair);
-
-    result[index] = [ keys[0], pair[keys[0]] ];
+    result[index] = [keys[0], pair[keys[0]]]
   }
 
-  return result;
+  return result
 }
 
 module.exports = new Type('tag:yaml.org,2002:pairs', {
   kind: 'sequence',
   resolve: resolveYamlPairs,
   construct: constructYamlPairs
-});
+})
 
 
 /***/ }),
@@ -37764,12 +36149,12 @@ module.exports = new Type('tag:yaml.org,2002:pairs', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
 module.exports = new Type('tag:yaml.org,2002:seq', {
   kind: 'sequence',
-  construct: function (data) { return data !== null ? data : []; }
-});
+  construct: function (data) { return data !== null ? data : [] }
+})
 
 
 /***/ }),
@@ -37780,33 +36165,33 @@ module.exports = new Type('tag:yaml.org,2002:seq', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
-var _hasOwnProperty = Object.prototype.hasOwnProperty;
+const _hasOwnProperty = Object.prototype.hasOwnProperty
 
-function resolveYamlSet(data) {
-  if (data === null) return true;
+function resolveYamlSet (data) {
+  if (data === null) return true
 
-  var key, object = data;
+  const object = data
 
-  for (key in object) {
+  for (const key in object) {
     if (_hasOwnProperty.call(object, key)) {
-      if (object[key] !== null) return false;
+      if (object[key] !== null) return false
     }
   }
 
-  return true;
+  return true
 }
 
-function constructYamlSet(data) {
-  return data !== null ? data : {};
+function constructYamlSet (data) {
+  return data !== null ? data : {}
 }
 
 module.exports = new Type('tag:yaml.org,2002:set', {
   kind: 'mapping',
   resolve: resolveYamlSet,
   construct: constructYamlSet
-});
+})
 
 
 /***/ }),
@@ -37817,12 +36202,12 @@ module.exports = new Type('tag:yaml.org,2002:set', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
 module.exports = new Type('tag:yaml.org,2002:str', {
   kind: 'scalar',
-  construct: function (data) { return data !== null ? data : ''; }
-});
+  construct: function (data) { return data !== null ? data : '' }
+})
 
 
 /***/ }),
@@ -37833,83 +36218,83 @@ module.exports = new Type('tag:yaml.org,2002:str', {
 "use strict";
 
 
-var Type = __nccwpck_require__(9557);
+const Type = __nccwpck_require__(9557)
 
-var YAML_DATE_REGEXP = new RegExp(
-  '^([0-9][0-9][0-9][0-9])'          + // [1] year
-  '-([0-9][0-9])'                    + // [2] month
-  '-([0-9][0-9])$');                   // [3] day
+const YAML_DATE_REGEXP = new RegExp(
+  '^([0-9][0-9][0-9][0-9])' + // [1] year
+  '-([0-9][0-9])' + // [2] month
+  '-([0-9][0-9])$')                   // [3] day
 
-var YAML_TIMESTAMP_REGEXP = new RegExp(
-  '^([0-9][0-9][0-9][0-9])'          + // [1] year
-  '-([0-9][0-9]?)'                   + // [2] month
-  '-([0-9][0-9]?)'                   + // [3] day
-  '(?:[Tt]|[ \\t]+)'                 + // ...
-  '([0-9][0-9]?)'                    + // [4] hour
-  ':([0-9][0-9])'                    + // [5] minute
-  ':([0-9][0-9])'                    + // [6] second
-  '(?:\\.([0-9]*))?'                 + // [7] fraction
-  '(?:[ \\t]*(Z|([-+])([0-9][0-9]?)' + // [8] tz [9] tz_sign [10] tz_hour
-  '(?::([0-9][0-9]))?))?$');           // [11] tz_minute
+const YAML_TIMESTAMP_REGEXP = new RegExp(
+  '^([0-9][0-9][0-9][0-9])' + // [1] year
+  '-([0-9][0-9]?)' + // [2] month
+  '-([0-9][0-9]?)' + // [3] day
+  '(?:[Tt]|[ \\t]+)' + // ...
+  '([0-9][0-9]?)' + // [4] hour
+  ':([0-9][0-9])' + // [5] minute
+  ':([0-9][0-9])' + // [6] second
+  '(?:\\.([0-9]*))?' + // [7] fraction
+  '(?:[ \\t]*(Z|([-+])([0-9][0-9]?)' + // [8] tz [9] tz_sign [10] tzHour
+  '(?::([0-9][0-9]))?))?$')           // [11] tzMinute
 
-function resolveYamlTimestamp(data) {
-  if (data === null) return false;
-  if (YAML_DATE_REGEXP.exec(data) !== null) return true;
-  if (YAML_TIMESTAMP_REGEXP.exec(data) !== null) return true;
-  return false;
+function resolveYamlTimestamp (data) {
+  if (data === null) return false
+  if (YAML_DATE_REGEXP.exec(data) !== null) return true
+  if (YAML_TIMESTAMP_REGEXP.exec(data) !== null) return true
+  return false
 }
 
-function constructYamlTimestamp(data) {
-  var match, year, month, day, hour, minute, second, fraction = 0,
-      delta = null, tz_hour, tz_minute, date;
+function constructYamlTimestamp (data) {
+  let fraction = 0
+  let delta = null
 
-  match = YAML_DATE_REGEXP.exec(data);
-  if (match === null) match = YAML_TIMESTAMP_REGEXP.exec(data);
+  let match = YAML_DATE_REGEXP.exec(data)
+  if (match === null) match = YAML_TIMESTAMP_REGEXP.exec(data)
 
-  if (match === null) throw new Error('Date resolve error');
+  if (match === null) throw new Error('Date resolve error')
 
   // match: [1] year [2] month [3] day
 
-  year = +(match[1]);
-  month = +(match[2]) - 1; // JS month starts with 0
-  day = +(match[3]);
+  const year = +(match[1])
+  const month = +(match[2]) - 1 // JS month starts with 0
+  const day = +(match[3])
 
   if (!match[4]) { // no hour
-    return new Date(Date.UTC(year, month, day));
+    return new Date(Date.UTC(year, month, day))
   }
 
   // match: [4] hour [5] minute [6] second [7] fraction
 
-  hour = +(match[4]);
-  minute = +(match[5]);
-  second = +(match[6]);
+  const hour = +(match[4])
+  const minute = +(match[5])
+  const second = +(match[6])
 
   if (match[7]) {
-    fraction = match[7].slice(0, 3);
+    fraction = match[7].slice(0, 3)
     while (fraction.length < 3) { // milli-seconds
-      fraction += '0';
+      fraction += '0'
     }
-    fraction = +fraction;
+    fraction = +fraction
   }
 
-  // match: [8] tz [9] tz_sign [10] tz_hour [11] tz_minute
+  // match: [8] tz [9] tz_sign [10] tzHour [11] tzMinute
 
   if (match[9]) {
-    tz_hour = +(match[10]);
-    tz_minute = +(match[11] || 0);
-    delta = (tz_hour * 60 + tz_minute) * 60000; // delta in mili-seconds
-    if (match[9] === '-') delta = -delta;
+    const tzHour = +(match[10])
+    const tzMinute = +(match[11] || 0)
+    delta = (tzHour * 60 + tzMinute) * 60000 // delta in mili-seconds
+    if (match[9] === '-') delta = -delta
   }
 
-  date = new Date(Date.UTC(year, month, day, hour, minute, second, fraction));
+  const date = new Date(Date.UTC(year, month, day, hour, minute, second, fraction))
 
-  if (delta) date.setTime(date.getTime() - delta);
+  if (delta) date.setTime(date.getTime() - delta)
 
-  return date;
+  return date
 }
 
-function representYamlTimestamp(object /*, style*/) {
-  return object.toISOString();
+function representYamlTimestamp (object /*, style */) {
+  return object.toISOString()
 }
 
 module.exports = new Type('tag:yaml.org,2002:timestamp', {
@@ -37918,7 +36303,7 @@ module.exports = new Type('tag:yaml.org,2002:timestamp', {
   construct: constructYamlTimestamp,
   instanceOf: Date,
   represent: representYamlTimestamp
-});
+})
 
 
 /***/ }),
@@ -41989,15 +40374,6 @@ function onceStrict (fn) {
 
 /***/ }),
 
-/***/ 82673:
-/***/ ((module) => {
-
-"use strict";
-function _typeof(obj){"@babel/helpers - typeof";return _typeof="function"==typeof Symbol&&"symbol"==typeof Symbol.iterator?function(obj){return typeof obj}:function(obj){return obj&&"function"==typeof Symbol&&obj.constructor===Symbol&&obj!==Symbol.prototype?"symbol":typeof obj},_typeof(obj)}function _createForOfIteratorHelper(o,allowArrayLike){var it=typeof Symbol!=="undefined"&&o[Symbol.iterator]||o["@@iterator"];if(!it){if(Array.isArray(o)||(it=_unsupportedIterableToArray(o))||allowArrayLike&&o&&typeof o.length==="number"){if(it)o=it;var i=0;var F=function F(){};return{s:F,n:function n(){if(i>=o.length)return{done:true};return{done:false,value:o[i++]}},e:function e(_e2){throw _e2},f:F}}throw new TypeError("Invalid attempt to iterate non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method.")}var normalCompletion=true,didErr=false,err;return{s:function s(){it=it.call(o)},n:function n(){var step=it.next();normalCompletion=step.done;return step},e:function e(_e3){didErr=true;err=_e3},f:function f(){try{if(!normalCompletion&&it["return"]!=null)it["return"]()}finally{if(didErr)throw err}}}}function _defineProperty(obj,key,value){key=_toPropertyKey(key);if(key in obj){Object.defineProperty(obj,key,{value:value,enumerable:true,configurable:true,writable:true})}else{obj[key]=value}return obj}function _toPropertyKey(arg){var key=_toPrimitive(arg,"string");return _typeof(key)==="symbol"?key:String(key)}function _toPrimitive(input,hint){if(_typeof(input)!=="object"||input===null)return input;var prim=input[Symbol.toPrimitive];if(prim!==undefined){var res=prim.call(input,hint||"default");if(_typeof(res)!=="object")return res;throw new TypeError("@@toPrimitive must return a primitive value.")}return(hint==="string"?String:Number)(input)}function _slicedToArray(arr,i){return _arrayWithHoles(arr)||_iterableToArrayLimit(arr,i)||_unsupportedIterableToArray(arr,i)||_nonIterableRest()}function _nonIterableRest(){throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method.")}function _unsupportedIterableToArray(o,minLen){if(!o)return;if(typeof o==="string")return _arrayLikeToArray(o,minLen);var n=Object.prototype.toString.call(o).slice(8,-1);if(n==="Object"&&o.constructor)n=o.constructor.name;if(n==="Map"||n==="Set")return Array.from(o);if(n==="Arguments"||/^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(n))return _arrayLikeToArray(o,minLen)}function _arrayLikeToArray(arr,len){if(len==null||len>arr.length)len=arr.length;for(var i=0,arr2=new Array(len);i<len;i++){arr2[i]=arr[i]}return arr2}function _iterableToArrayLimit(arr,i){var _i=null==arr?null:"undefined"!=typeof Symbol&&arr[Symbol.iterator]||arr["@@iterator"];if(null!=_i){var _s,_e,_x,_r,_arr=[],_n=!0,_d=!1;try{if(_x=(_i=_i.call(arr)).next,0===i){if(Object(_i)!==_i)return;_n=!1}else for(;!(_n=(_s=_x.call(_i)).done)&&(_arr.push(_s.value),_arr.length!==i);_n=!0){;}}catch(err){_d=!0,_e=err}finally{try{if(!_n&&null!=_i["return"]&&(_r=_i["return"](),Object(_r)!==_r))return}finally{if(_d)throw _e}}return _arr}}function _arrayWithHoles(arr){if(Array.isArray(arr))return arr}module.exports=function(input){if(!input)return[];if(typeof input!=="string"||input.match(/^\s+$/))return[];var lines=input.split("\n");if(lines.length===0)return[];var files=[];var currentFile=null;var currentChunk=null;var deletedLineCounter=0;var addedLineCounter=0;var currentFileChanges=null;var normal=function normal(line){var _currentChunk;(_currentChunk=currentChunk)===null||_currentChunk===void 0?void 0:_currentChunk.changes.push({type:"normal",normal:true,ln1:deletedLineCounter++,ln2:addedLineCounter++,content:line});currentFileChanges.oldLines--;currentFileChanges.newLines--};var start=function start(line){var _parseFiles;var _ref=(_parseFiles=parseFiles(line))!==null&&_parseFiles!==void 0?_parseFiles:[],_ref2=_slicedToArray(_ref,2),fromFileName=_ref2[0],toFileName=_ref2[1];currentFile={chunks:[],deletions:0,additions:0,from:fromFileName,to:toFileName};files.push(currentFile)};var restart=function restart(){if(!currentFile||currentFile.chunks.length)start()};var newFile=function newFile(_,match){restart();currentFile["new"]=true;currentFile.newMode=match[1];currentFile.from="/dev/null"};var deletedFile=function deletedFile(_,match){restart();currentFile.deleted=true;currentFile.oldMode=match[1];currentFile.to="/dev/null"};var oldMode=function oldMode(_,match){restart();currentFile.oldMode=match[1]};var newMode=function newMode(_,match){restart();currentFile.newMode=match[1]};var index=function index(line,match){restart();currentFile.index=line.split(" ").slice(1);if(match[1]){currentFile.oldMode=currentFile.newMode=match[1].trim()}};var fromFile=function fromFile(line){restart();currentFile.from=parseOldOrNewFile(line)};var toFile=function toFile(line){restart();currentFile.to=parseOldOrNewFile(line)};var toNumOfLines=function toNumOfLines(number){return+(number||1)};var chunk=function chunk(line,match){if(!currentFile){start(line)}var _match$slice=match.slice(1),_match$slice2=_slicedToArray(_match$slice,4),oldStart=_match$slice2[0],oldNumLines=_match$slice2[1],newStart=_match$slice2[2],newNumLines=_match$slice2[3];deletedLineCounter=+oldStart;addedLineCounter=+newStart;currentChunk={content:line,changes:[],oldStart:+oldStart,oldLines:toNumOfLines(oldNumLines),newStart:+newStart,newLines:toNumOfLines(newNumLines)};currentFileChanges={oldLines:toNumOfLines(oldNumLines),newLines:toNumOfLines(newNumLines)};currentFile.chunks.push(currentChunk)};var del=function del(line){if(!currentChunk)return;currentChunk.changes.push({type:"del",del:true,ln:deletedLineCounter++,content:line});currentFile.deletions++;currentFileChanges.oldLines--};var add=function add(line){if(!currentChunk)return;currentChunk.changes.push({type:"add",add:true,ln:addedLineCounter++,content:line});currentFile.additions++;currentFileChanges.newLines--};var eof=function eof(line){var _currentChunk$changes3;if(!currentChunk)return;var _currentChunk$changes=currentChunk.changes.slice(-1),_currentChunk$changes2=_slicedToArray(_currentChunk$changes,1),mostRecentChange=_currentChunk$changes2[0];currentChunk.changes.push((_currentChunk$changes3={type:mostRecentChange.type},_defineProperty(_currentChunk$changes3,mostRecentChange.type,true),_defineProperty(_currentChunk$changes3,"ln1",mostRecentChange.ln1),_defineProperty(_currentChunk$changes3,"ln2",mostRecentChange.ln2),_defineProperty(_currentChunk$changes3,"ln",mostRecentChange.ln),_defineProperty(_currentChunk$changes3,"content",line),_currentChunk$changes3))};var schemaHeaders=[[/^diff\s/,start],[/^new file mode (\d+)$/,newFile],[/^deleted file mode (\d+)$/,deletedFile],[/^old mode (\d+)$/,oldMode],[/^new mode (\d+)$/,newMode],[/^index\s[\da-zA-Z]+\.\.[\da-zA-Z]+(\s(\d+))?$/,index],[/^---\s/,fromFile],[/^\+\+\+\s/,toFile],[/^@@\s+-(\d+),?(\d+)?\s+\+(\d+),?(\d+)?\s@@/,chunk],[/^\\ No newline at end of file$/,eof]];var schemaContent=[[/^\\ No newline at end of file$/,eof],[/^-/,del],[/^\+/,add],[/^\s+/,normal]];var parseContentLine=function parseContentLine(line){for(var _i2=0,_schemaContent=schemaContent;_i2<_schemaContent.length;_i2++){var _schemaContent$_i=_slicedToArray(_schemaContent[_i2],2),pattern=_schemaContent$_i[0],handler=_schemaContent$_i[1];var match=line.match(pattern);if(match){handler(line,match);break}}if(currentFileChanges.oldLines===0&&currentFileChanges.newLines===0){currentFileChanges=null}};var parseHeaderLine=function parseHeaderLine(line){for(var _i3=0,_schemaHeaders=schemaHeaders;_i3<_schemaHeaders.length;_i3++){var _schemaHeaders$_i=_slicedToArray(_schemaHeaders[_i3],2),pattern=_schemaHeaders$_i[0],handler=_schemaHeaders$_i[1];var match=line.match(pattern);if(match){handler(line,match);break}}};var parseLine=function parseLine(line){if(currentFileChanges){parseContentLine(line)}else{parseHeaderLine(line)}return};var _iterator=_createForOfIteratorHelper(lines),_step;try{for(_iterator.s();!(_step=_iterator.n()).done;){var line=_step.value;parseLine(line)}}catch(err){_iterator.e(err)}finally{_iterator.f()}return files};var fileNameDiffRegex=/(a|i|w|c|o|1|2)\/.*(?=["']? ["']?(b|i|w|c|o|1|2)\/)|(b|i|w|c|o|1|2)\/.*$/g;var gitFileHeaderRegex=/^(a|b|i|w|c|o|1|2)\//;var parseFiles=function parseFiles(line){var fileNames=line===null||line===void 0?void 0:line.match(fileNameDiffRegex);return fileNames===null||fileNames===void 0?void 0:fileNames.map(function(fileName){return fileName.replace(gitFileHeaderRegex,"").replace(/("|')$/,"")})};var qoutedFileNameRegex=/^\\?['"]|\\?['"]$/g;var parseOldOrNewFile=function parseOldOrNewFile(line){var fileName=leftTrimChars(line,"-+").trim();fileName=removeTimeStamp(fileName);return fileName.replace(qoutedFileNameRegex,"").replace(gitFileHeaderRegex,"")};var leftTrimChars=function leftTrimChars(string,trimmingChars){string=makeString(string);if(!trimmingChars&&String.prototype.trimLeft)return string.trimLeft();var trimmingString=formTrimmingString(trimmingChars);return string.replace(new RegExp("^".concat(trimmingString,"+")),"")};var timeStampRegex=/\t.*|\d{4}-\d\d-\d\d\s\d\d:\d\d:\d\d(.\d+)?\s(\+|-)\d\d\d\d/;var removeTimeStamp=function removeTimeStamp(string){var timeStamp=timeStampRegex.exec(string);if(timeStamp){string=string.substring(0,timeStamp.index).trim()}return string};var formTrimmingString=function formTrimmingString(trimmingChars){if(trimmingChars===null||trimmingChars===undefined)return"\\s";else if(trimmingChars instanceof RegExp)return trimmingChars.source;return"[".concat(makeString(trimmingChars).replace(/([.*+?^=!:${}()|[\]/\\])/g,"\\$1"),"]")};var makeString=function makeString(itemToConvert){return(itemToConvert!==null&&itemToConvert!==void 0?itemToConvert:"")+""};
-
-
-/***/ }),
-
 /***/ 11512:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -42030,6 +40406,7 @@ class DefaultChangelogNotes {
         this.mainTemplate = options.mainTemplate;
     }
     async buildNotes(commits, options) {
+        var _a;
         const context = {
             host: options.host || DEFAULT_HOST,
             owner: options.owner,
@@ -42044,8 +40421,11 @@ class DefaultChangelogNotes {
             config.types = options.changelogSections;
         }
         const preset = await presetFactory(config);
+        // Replace the default ", closes" keyword with ", refs" to prevent GitHub from
+        // automatically closing referenced issues when the release PR is merged.
         preset.writerOpts.commitPartial =
-            this.commitPartial || preset.writerOpts.commitPartial;
+            this.commitPartial ||
+                ((_a = preset.writerOpts.commitPartial) === null || _a === void 0 ? void 0 : _a.replace(/,\s*closes/g, ', refs'));
         preset.writerOpts.headerPartial =
             this.headerPartial || preset.writerOpts.headerPartial;
         preset.writerOpts.mainTemplate =
@@ -42866,6 +41246,7 @@ const elixir_1 = __nccwpck_require__(19177);
 const expo_1 = __nccwpck_require__(85730);
 const go_1 = __nccwpck_require__(90652);
 const go_yoshi_1 = __nccwpck_require__(83131);
+const go_librarian_1 = __nccwpck_require__(57037);
 const helm_1 = __nccwpck_require__(48110);
 const java_1 = __nccwpck_require__(61762);
 const java_yoshi_1 = __nccwpck_require__(24441);
@@ -42873,13 +41254,17 @@ const java_yoshi_mono_repo_1 = __nccwpck_require__(72938);
 const krm_blueprint_1 = __nccwpck_require__(56782);
 const maven_1 = __nccwpck_require__(3827);
 const node_1 = __nccwpck_require__(81322);
+const node_librarian_1 = __nccwpck_require__(43803);
 const ocaml_1 = __nccwpck_require__(44164);
 const php_1 = __nccwpck_require__(73288);
 const php_yoshi_1 = __nccwpck_require__(21031);
+const php_librarian_1 = __nccwpck_require__(6145);
 const python_1 = __nccwpck_require__(86160);
+const python_librarian_1 = __nccwpck_require__(8825);
 const r_1 = __nccwpck_require__(9874);
 const ruby_1 = __nccwpck_require__(27882);
 const ruby_yoshi_1 = __nccwpck_require__(44273);
+const ruby_librarian_1 = __nccwpck_require__(50587);
 const rust_1 = __nccwpck_require__(94944);
 const sfdx_1 = __nccwpck_require__(24523);
 const simple_1 = __nccwpck_require__(89848);
@@ -42894,6 +41279,7 @@ const releasers = {
     'dotnet-yoshi': options => new dotnet_yoshi_1.DotnetYoshi(options),
     go: options => new go_1.Go(options),
     'go-yoshi': options => new go_yoshi_1.GoYoshi(options),
+    'go-librarian': options => new go_librarian_1.GoLibrarian(options),
     java: options => new java_1.Java(options),
     maven: options => new maven_1.Maven(options),
     'java-yoshi': options => new java_yoshi_1.JavaYoshi(options),
@@ -42915,14 +41301,18 @@ const releasers = {
     }),
     'krm-blueprint': options => new krm_blueprint_1.KRMBlueprint(options),
     node: options => new node_1.Node(options),
+    'node-librarian': options => new node_librarian_1.NodeLibrarian(options),
     expo: options => new expo_1.Expo(options),
     ocaml: options => new ocaml_1.OCaml(options),
     php: options => new php_1.PHP(options),
     'php-yoshi': options => new php_yoshi_1.PHPYoshi(options),
+    'php-librarian': options => new php_librarian_1.PHPLibrarian(options),
     python: options => new python_1.Python(options),
+    'python-librarian': options => new python_librarian_1.PythonLibrarian(options),
     r: options => new r_1.R(options),
     ruby: options => new ruby_1.Ruby(options),
     'ruby-yoshi': options => new ruby_yoshi_1.RubyYoshi(options),
+    'ruby-librarian': options => new ruby_librarian_1.RubyLibrarian(options),
     rust: options => new rust_1.Rust(options),
     salesforce: options => new sfdx_1.Sfdx(options),
     sfdx: options => new sfdx_1.Sfdx(options),
@@ -43036,6 +41426,19 @@ class GitHubApi {
                         throw err;
                     }
                     this.logger.info(`received 502 error, ${maxRetries} attempts remaining`);
+                    if (typeof opts.num === 'number') {
+                        if (maxRetries === 1) {
+                            this.logger.info('last retry, forcing batch size to 1');
+                            opts.num = 1;
+                        }
+                        else {
+                            const nextNum = Math.floor(opts.num / 2);
+                            if (nextNum >= 1) {
+                                this.logger.info(`halving batch size from ${opts.num} to ${nextNum}`);
+                                opts.num = nextNum;
+                            }
+                        }
+                    }
                 }
                 maxRetries -= 1;
                 if (maxRetries >= 0) {
@@ -43742,7 +42145,7 @@ exports.sleepInMs = sleepInMs;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.sleepInMs = exports.GitHub = void 0;
 const request_error_1 = __nccwpck_require__(93708);
-const code_suggester_1 = __nccwpck_require__(58903);
+const code_suggester_1 = __nccwpck_require__(53579);
 const errors_1 = __nccwpck_require__(88302);
 const MAX_ISSUE_BODY_SIZE = 65536;
 const MAX_SLEEP_SECONDS = 20;
@@ -43807,6 +42210,19 @@ class GitHub {
                         throw err;
                     }
                     this.logger.info(`received 502 error, ${maxRetries} attempts remaining`);
+                    if (typeof opts.num === 'number') {
+                        if (maxRetries === 1) {
+                            this.logger.info('last retry, forcing batch size to 1');
+                            opts.num = 1;
+                        }
+                        else {
+                            const nextNum = Math.floor(opts.num / 2);
+                            if (nextNum >= 1) {
+                                this.logger.info(`halving batch size from ${opts.num} to ${nextNum}`);
+                                opts.num = nextNum;
+                            }
+                        }
+                    }
                 }
                 maxRetries -= 1;
                 if (maxRetries >= 0) {
@@ -44526,7 +42942,7 @@ Object.defineProperty(exports, "GitHub", ({ enumerable: true, get: function () {
 exports.configSchema = __nccwpck_require__(84663);
 exports.manifestSchema = __nccwpck_require__(22524);
 // x-release-please-start-version
-exports.VERSION = '17.6.0';
+exports.VERSION = '17.11.2';
 // x-release-please-end
 //# sourceMappingURL=index.js.map
 
@@ -44749,26 +43165,28 @@ class Manifest {
                 continue;
             }
             const component = tagName.component || exports.DEFAULT_COMPONENT_NAME;
-            const path = pathsByComponent[component];
-            if (!path) {
+            const paths = pathsByComponent[component] || [];
+            if (paths.length === 0) {
                 this.logger.warn(`Found release tag with component '${component}', but not configured in manifest`);
                 continue;
             }
-            const expectedVersion = this.releasedVersions[path];
-            if (!expectedVersion) {
-                this.logger.warn(`Unable to find expected version for path '${path}' in manifest`);
-                continue;
-            }
-            if (expectedVersion.toString() === tagName.version.toString()) {
-                this.logger.debug(`Found release for path ${path}, ${release.tagName}`);
-                releaseShasByPath[path] = release.sha;
-                releasesByPath[path] = {
-                    name: release.name,
-                    tag: tagName,
-                    sha: release.sha,
-                    notes: release.notes || '',
-                };
-                releasesFound += 1;
+            for (const path of paths) {
+                const expectedVersion = this.releasedVersions[path];
+                if (!expectedVersion) {
+                    this.logger.warn(`Unable to find expected version for path '${path}' in manifest`);
+                    continue;
+                }
+                if (expectedVersion.toString() === tagName.version.toString()) {
+                    this.logger.debug(`Found release for path ${path}, ${release.tagName}`);
+                    releaseShasByPath[path] = release.sha;
+                    releasesByPath[path] = {
+                        name: release.name,
+                        tag: tagName,
+                        sha: release.sha,
+                        notes: release.notes || '',
+                    };
+                    releasesFound += 1;
+                }
             }
             if (releasesFound >= expectedReleases) {
                 break;
@@ -45338,10 +43756,10 @@ class Manifest {
             for (const path in this.repositoryConfig) {
                 const strategy = strategiesByPath[path];
                 const component = (await strategy.getComponent()) || '';
-                if (this._pathsByComponent[component]) {
-                    this.logger.warn(`Multiple paths for ${component}: ${this._pathsByComponent[component]}, ${path}`);
+                if (!this._pathsByComponent[component]) {
+                    this._pathsByComponent[component] = [];
                 }
-                this._pathsByComponent[component] = path;
+                this._pathsByComponent[component].push(path);
             }
         }
         return this._pathsByComponent;
@@ -45610,7 +44028,7 @@ async function latestReleaseVersion(github, targetBranch, releaseFilter, config,
     return candidateTagVersion.sort((a, b) => b.compare(a))[0];
 }
 function mergeReleaserConfig(defaultConfig, pathConfig) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13;
     return {
         releaseType: (_b = (_a = pathConfig.releaseType) !== null && _a !== void 0 ? _a : defaultConfig.releaseType) !== null && _b !== void 0 ? _b : 'node',
         bumpMinorPreMajor: (_c = pathConfig.bumpMinorPreMajor) !== null && _c !== void 0 ? _c : defaultConfig.bumpMinorPreMajor,
@@ -45627,27 +44045,30 @@ function mergeReleaserConfig(defaultConfig, pathConfig) {
         skipChangelog: (_p = pathConfig.skipChangelog) !== null && _p !== void 0 ? _p : defaultConfig.skipChangelog,
         draft: (_q = pathConfig.draft) !== null && _q !== void 0 ? _q : defaultConfig.draft,
         forceTag: (_r = pathConfig.forceTag) !== null && _r !== void 0 ? _r : defaultConfig.forceTag,
-        annotatedTag: (_s = pathConfig.annotatedTag) !== null && _s !== void 0 ? _s : defaultConfig.annotatedTag,
-        draftPullRequest: (_t = pathConfig.draftPullRequest) !== null && _t !== void 0 ? _t : defaultConfig.draftPullRequest,
-        prerelease: (_u = pathConfig.prerelease) !== null && _u !== void 0 ? _u : defaultConfig.prerelease,
-        component: (_v = pathConfig.component) !== null && _v !== void 0 ? _v : defaultConfig.component,
-        packageName: (_w = pathConfig.packageName) !== null && _w !== void 0 ? _w : defaultConfig.packageName,
-        versionFile: (_x = pathConfig.versionFile) !== null && _x !== void 0 ? _x : defaultConfig.versionFile,
-        extraFiles: (_y = pathConfig.extraFiles) !== null && _y !== void 0 ? _y : defaultConfig.extraFiles,
-        includeComponentInTag: (_z = pathConfig.includeComponentInTag) !== null && _z !== void 0 ? _z : defaultConfig.includeComponentInTag,
-        includeVInTag: (_0 = pathConfig.includeVInTag) !== null && _0 !== void 0 ? _0 : defaultConfig.includeVInTag,
-        includeVInReleaseName: (_1 = pathConfig.includeVInReleaseName) !== null && _1 !== void 0 ? _1 : defaultConfig.includeVInReleaseName,
-        tagSeparator: (_2 = pathConfig.tagSeparator) !== null && _2 !== void 0 ? _2 : defaultConfig.tagSeparator,
-        pullRequestTitlePattern: (_3 = pathConfig.pullRequestTitlePattern) !== null && _3 !== void 0 ? _3 : defaultConfig.pullRequestTitlePattern,
-        pullRequestHeader: (_4 = pathConfig.pullRequestHeader) !== null && _4 !== void 0 ? _4 : defaultConfig.pullRequestHeader,
-        pullRequestFooter: (_5 = pathConfig.pullRequestFooter) !== null && _5 !== void 0 ? _5 : defaultConfig.pullRequestFooter,
-        componentNoSpace: (_6 = pathConfig.componentNoSpace) !== null && _6 !== void 0 ? _6 : defaultConfig.componentNoSpace,
-        separatePullRequests: (_7 = pathConfig.separatePullRequests) !== null && _7 !== void 0 ? _7 : defaultConfig.separatePullRequests,
-        skipSnapshot: (_8 = pathConfig.skipSnapshot) !== null && _8 !== void 0 ? _8 : defaultConfig.skipSnapshot,
-        initialVersion: (_9 = pathConfig.initialVersion) !== null && _9 !== void 0 ? _9 : defaultConfig.initialVersion,
-        extraLabels: (_10 = pathConfig.extraLabels) !== null && _10 !== void 0 ? _10 : defaultConfig.extraLabels,
-        excludePaths: (_11 = pathConfig.excludePaths) !== null && _11 !== void 0 ? _11 : defaultConfig.excludePaths,
-        dateFormat: (_12 = pathConfig.dateFormat) !== null && _12 !== void 0 ? _12 : defaultConfig.dateFormat,
+        // Annotated tags are the default: Git's own documentation says release
+        // tags should be annotated, and the GitHub Releases API only ever
+        // creates a lightweight tag. Opt out with `"annotated-tag": false`.
+        annotatedTag: (_t = (_s = pathConfig.annotatedTag) !== null && _s !== void 0 ? _s : defaultConfig.annotatedTag) !== null && _t !== void 0 ? _t : true,
+        draftPullRequest: (_u = pathConfig.draftPullRequest) !== null && _u !== void 0 ? _u : defaultConfig.draftPullRequest,
+        prerelease: (_v = pathConfig.prerelease) !== null && _v !== void 0 ? _v : defaultConfig.prerelease,
+        component: (_w = pathConfig.component) !== null && _w !== void 0 ? _w : defaultConfig.component,
+        packageName: (_x = pathConfig.packageName) !== null && _x !== void 0 ? _x : defaultConfig.packageName,
+        versionFile: (_y = pathConfig.versionFile) !== null && _y !== void 0 ? _y : defaultConfig.versionFile,
+        extraFiles: (_z = pathConfig.extraFiles) !== null && _z !== void 0 ? _z : defaultConfig.extraFiles,
+        includeComponentInTag: (_0 = pathConfig.includeComponentInTag) !== null && _0 !== void 0 ? _0 : defaultConfig.includeComponentInTag,
+        includeVInTag: (_1 = pathConfig.includeVInTag) !== null && _1 !== void 0 ? _1 : defaultConfig.includeVInTag,
+        includeVInReleaseName: (_2 = pathConfig.includeVInReleaseName) !== null && _2 !== void 0 ? _2 : defaultConfig.includeVInReleaseName,
+        tagSeparator: (_3 = pathConfig.tagSeparator) !== null && _3 !== void 0 ? _3 : defaultConfig.tagSeparator,
+        pullRequestTitlePattern: (_4 = pathConfig.pullRequestTitlePattern) !== null && _4 !== void 0 ? _4 : defaultConfig.pullRequestTitlePattern,
+        pullRequestHeader: (_5 = pathConfig.pullRequestHeader) !== null && _5 !== void 0 ? _5 : defaultConfig.pullRequestHeader,
+        pullRequestFooter: (_6 = pathConfig.pullRequestFooter) !== null && _6 !== void 0 ? _6 : defaultConfig.pullRequestFooter,
+        componentNoSpace: (_7 = pathConfig.componentNoSpace) !== null && _7 !== void 0 ? _7 : defaultConfig.componentNoSpace,
+        separatePullRequests: (_8 = pathConfig.separatePullRequests) !== null && _8 !== void 0 ? _8 : defaultConfig.separatePullRequests,
+        skipSnapshot: (_9 = pathConfig.skipSnapshot) !== null && _9 !== void 0 ? _9 : defaultConfig.skipSnapshot,
+        initialVersion: (_10 = pathConfig.initialVersion) !== null && _10 !== void 0 ? _10 : defaultConfig.initialVersion,
+        extraLabels: (_11 = pathConfig.extraLabels) !== null && _11 !== void 0 ? _11 : defaultConfig.extraLabels,
+        excludePaths: (_12 = pathConfig.excludePaths) !== null && _12 !== void 0 ? _12 : defaultConfig.excludePaths,
+        dateFormat: (_13 = pathConfig.dateFormat) !== null && _13 !== void 0 ? _13 : defaultConfig.dateFormat,
     };
 }
 /**
@@ -46315,7 +44736,7 @@ class LinkedVersions extends plugin_1.ManifestPlugin {
         // delegate to the merge plugin and add merged pull request
         if (inScopeCandidates.length > 0) {
             const merge = new merge_1.Merge(this.github, this.targetBranch, this.repositoryConfig, {
-                pullRequestTitlePattern: `chore\${scope}: release ${this.groupName} libraries`,
+                pullRequestTitlePattern: 'chore${scope}: release ' + this.groupName + ' libraries',
                 forceMerge: true,
                 headBranchName: branch_name_1.BranchName.ofGroupTargetBranch(this.groupName, this.targetBranch).toString(),
             });
@@ -48014,6 +46435,14 @@ class BaseStrategy {
             this.logger.error(`Bad branch name: ${mergedPullRequest.headBranchName}`);
             return;
         }
+        const branchComponent = await this.getBranchComponent();
+        if (branchName.isComponent()) {
+            if (this.normalizeComponent(branchName.component) !==
+                this.normalizeComponent(branchComponent)) {
+                this.logger.info(`PR branch component: ${branchName.component} does not match configured branch component: ${branchComponent}`);
+                return;
+            }
+        }
         const pullRequestBody = await this.parsePullRequestBody(mergedPullRequest.body);
         if (!pullRequestBody) {
             this.logger.error('Could not parse pull request body as a release PR');
@@ -48491,6 +46920,97 @@ exports.Expo = Expo;
 
 /***/ }),
 
+/***/ 57037:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.GoLibrarian = void 0;
+const base_1 = __nccwpck_require__(33251);
+const changelog_1 = __nccwpck_require__(33141);
+const librarian_yaml_1 = __nccwpck_require__(55823);
+const version_1 = __nccwpck_require__(33592);
+const version_go_1 = __nccwpck_require__(34017);
+class GoLibrarian extends base_1.BaseStrategy {
+    constructor(options) {
+        var _a, _b;
+        options.changelogPath = (_a = options.changelogPath) !== null && _a !== void 0 ? _a : 'CHANGES.md';
+        super(options);
+        this.versionFile = (_b = options.versionFile) !== null && _b !== void 0 ? _b : 'internal/version.go';
+    }
+    async getComponent() {
+        const component = await super.getComponent();
+        if (component) {
+            const match = component.match(/^(.*)\/v[2-9]\d*$/);
+            if (match) {
+                return match[1];
+            }
+        }
+        return component;
+    }
+    async getBranchComponent() {
+        const component = await super.getBranchComponent();
+        return component ? component.replace(/\//g, '-') : undefined;
+    }
+    async buildUpdates(options) {
+        const updates = [];
+        const version = options.newVersion;
+        if (!this.skipChangelog) {
+            updates.push({
+                path: this.addPath(this.changelogPath),
+                createIfMissing: true,
+                updater: new changelog_1.Changelog({
+                    version,
+                    changelogEntry: options.changelogEntry,
+                }),
+            });
+        }
+        if (this.versionFile) {
+            updates.push({
+                path: this.addPath(this.versionFile),
+                createIfMissing: false,
+                updater: new version_go_1.VersionGo({
+                    version,
+                }),
+            });
+        }
+        updates.push({
+            path: 'librarian.yaml',
+            createIfMissing: false,
+            updater: new librarian_yaml_1.LibrarianYamlUpdater({
+                version,
+                packagePath: this.path,
+                component: this.component,
+            }),
+        });
+        return updates;
+    }
+    initialReleaseVersion() {
+        if (this.initialVersion) {
+            return version_1.Version.parse(this.initialVersion);
+        }
+        return version_1.Version.parse('0.1.0');
+    }
+}
+exports.GoLibrarian = GoLibrarian;
+//# sourceMappingURL=go-librarian.js.map
+
+/***/ }),
+
 /***/ 83131:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -48835,7 +47355,7 @@ const composite_1 = __nccwpck_require__(85608);
 const errors_1 = __nccwpck_require__(88302);
 const java_1 = __nccwpck_require__(61762);
 const java_update_1 = __nccwpck_require__(93546);
-const librarian_yaml_1 = __nccwpck_require__(4326);
+const librarian_yaml_1 = __nccwpck_require__(55823);
 const filter_commits_1 = __nccwpck_require__(53380);
 class JavaYoshiMonoRepo extends java_1.Java {
     /**
@@ -49656,6 +48176,134 @@ exports.Maven = Maven;
 
 /***/ }),
 
+/***/ 43803:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.NodeLibrarian = void 0;
+const base_1 = __nccwpck_require__(33251);
+const changelog_json_1 = __nccwpck_require__(88896);
+const package_lock_json_1 = __nccwpck_require__(92481);
+const samples_package_json_1 = __nccwpck_require__(88941);
+const changelog_1 = __nccwpck_require__(33141);
+const package_json_1 = __nccwpck_require__(20239);
+const librarian_yaml_1 = __nccwpck_require__(55823);
+const errors_1 = __nccwpck_require__(88302);
+const filter_commits_1 = __nccwpck_require__(53380);
+class NodeLibrarian extends base_1.BaseStrategy {
+    async buildUpdates(options) {
+        var _a;
+        const updates = [];
+        const version = options.newVersion;
+        const versionsMap = options.versionsMap;
+        const packageName = (_a = (await this.getPackageName())) !== null && _a !== void 0 ? _a : '';
+        const lockFiles = ['package-lock.json', 'npm-shrinkwrap.json'];
+        lockFiles.forEach(lockFile => {
+            updates.push({
+                path: this.addPath(lockFile),
+                createIfMissing: false,
+                updater: new package_lock_json_1.PackageLockJson({
+                    version,
+                    versionsMap,
+                }),
+            });
+        });
+        updates.push({
+            path: this.addPath('samples/package.json'),
+            createIfMissing: false,
+            updater: new samples_package_json_1.SamplesPackageJson({
+                version,
+                packageName,
+            }),
+        });
+        !this.skipChangelog &&
+            updates.push({
+                path: this.addPath(this.changelogPath),
+                createIfMissing: true,
+                updater: new changelog_1.Changelog({
+                    version,
+                    changelogEntry: options.changelogEntry,
+                }),
+            });
+        updates.push({
+            path: this.addPath('package.json'),
+            createIfMissing: false,
+            cachedFileContents: this.pkgJsonContents,
+            updater: new package_json_1.PackageJson({
+                version,
+            }),
+        });
+        // If a machine readable changelog.json exists update it:
+        if (options.commits && packageName && !this.skipChangelog) {
+            const commits = (0, filter_commits_1.filterCommits)(options.commits, this.changelogSections);
+            updates.push({
+                path: 'changelog.json',
+                createIfMissing: false,
+                updater: new changelog_json_1.ChangelogJson({
+                    artifactName: packageName,
+                    version,
+                    commits,
+                    language: 'JAVASCRIPT',
+                }),
+            });
+        }
+        // Update librarian.yaml if this package exists within it.
+        updates.push({
+            path: 'librarian.yaml',
+            createIfMissing: false,
+            updater: new librarian_yaml_1.LibrarianYamlUpdater({
+                version,
+                packagePath: this.path,
+            }),
+        });
+        return updates;
+    }
+    async getDefaultPackageName() {
+        const pkgJsonContents = await this.getPkgJsonContents();
+        const pkg = JSON.parse(pkgJsonContents.parsedContent);
+        return pkg.name;
+    }
+    normalizeComponent(component) {
+        if (!component) {
+            return '';
+        }
+        return component.match(/^@[\w-]+\//) ? component.split('/')[1] : component;
+    }
+    async getPkgJsonContents() {
+        if (!this.pkgJsonContents) {
+            try {
+                this.pkgJsonContents = await this.github.getFileContentsOnBranch(this.addPath('package.json'), this.targetBranch);
+            }
+            catch (e) {
+                if (e instanceof errors_1.FileNotFoundError) {
+                    throw new errors_1.MissingRequiredFileError(this.addPath('package.json'), 'node', `${this.repository.owner}/${this.repository.repo}`);
+                }
+                throw e;
+            }
+        }
+        return this.pkgJsonContents;
+    }
+}
+exports.NodeLibrarian = NodeLibrarian;
+//# sourceMappingURL=node-librarian.js.map
+
+/***/ }),
+
 /***/ 81322:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -49864,6 +48512,48 @@ class OCaml extends base_1.BaseStrategy {
 }
 exports.OCaml = OCaml;
 //# sourceMappingURL=ocaml.js.map
+
+/***/ }),
+
+/***/ 6145:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.PHPLibrarian = void 0;
+const php_yoshi_1 = __nccwpck_require__(21031);
+const librarian_yaml_1 = __nccwpck_require__(55823);
+class PHPLibrarian extends php_yoshi_1.PHPYoshi {
+    async buildUpdates(options) {
+        const updates = await super.buildUpdates(options);
+        // Update librarian.yaml if this package exists within it.
+        updates.push({
+            path: 'librarian.yaml',
+            createIfMissing: false,
+            updater: new librarian_yaml_1.LibrarianYamlUpdater({
+                version: options.newVersion,
+                packagePath: this.path,
+            }),
+        });
+        return updates;
+    }
+}
+exports.PHPLibrarian = PHPLibrarian;
+//# sourceMappingURL=php-librarian.js.map
 
 /***/ }),
 
@@ -50212,6 +48902,48 @@ exports.PHP = PHP;
 
 /***/ }),
 
+/***/ 8825:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.PythonLibrarian = void 0;
+const python_1 = __nccwpck_require__(86160);
+const librarian_yaml_1 = __nccwpck_require__(55823);
+class PythonLibrarian extends python_1.Python {
+    async buildUpdates(options) {
+        const updates = await super.buildUpdates(options);
+        // Update librarian.yaml if this package exists within it.
+        updates.push({
+            path: 'librarian.yaml',
+            createIfMissing: false,
+            updater: new librarian_yaml_1.LibrarianYamlUpdater({
+                version: options.newVersion,
+                packagePath: this.path,
+            }),
+        });
+        return updates;
+    }
+}
+exports.PythonLibrarian = PythonLibrarian;
+//# sourceMappingURL=python-librarian.js.map
+
+/***/ }),
+
 /***/ 86160:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -50471,6 +49203,48 @@ class R extends base_1.BaseStrategy {
 }
 exports.R = R;
 //# sourceMappingURL=r.js.map
+
+/***/ }),
+
+/***/ 50587:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.RubyLibrarian = void 0;
+const ruby_yoshi_1 = __nccwpck_require__(44273);
+const librarian_yaml_1 = __nccwpck_require__(55823);
+class RubyLibrarian extends ruby_yoshi_1.RubyYoshi {
+    async buildUpdates(options) {
+        const updates = await super.buildUpdates(options);
+        // Update librarian.yaml if this package exists within it.
+        updates.push({
+            path: 'librarian.yaml',
+            createIfMissing: false,
+            updater: new librarian_yaml_1.LibrarianYamlUpdater({
+                version: options.newVersion,
+                packagePath: this.path,
+            }),
+        });
+        return updates;
+    }
+}
+exports.RubyLibrarian = RubyLibrarian;
+//# sourceMappingURL=ruby-librarian.js.map
 
 /***/ }),
 
@@ -52135,7 +50909,7 @@ exports.VersionGo = void 0;
 const default_1 = __nccwpck_require__(32550);
 class VersionGo extends default_1.DefaultUpdater {
     updateContent(content) {
-        return content.replace(/const Version = "[0-9]+\.[0-9]+\.[0-9](-\w+)?"/, `const Version = "${this.version.toString()}"`);
+        return content.replace(/const Version = "[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"/, `const Version = "${this.version.toString()}"`);
     }
 }
 exports.VersionGo = VersionGo;
@@ -52341,94 +51115,6 @@ class JavaUpdate extends default_1.DefaultUpdater {
 }
 exports.JavaUpdate = JavaUpdate;
 //# sourceMappingURL=java-update.js.map
-
-/***/ }),
-
-/***/ 4326:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.LibrarianYamlUpdater = void 0;
-const default_1 = __nccwpck_require__(32550);
-const yaml = __nccwpck_require__(38815);
-const logger_1 = __nccwpck_require__(4493);
-/**
- * Updates a librarian.yaml file.
- */
-class LibrarianYamlUpdater extends default_1.DefaultUpdater {
-    constructor() {
-        super(...arguments);
-        this.specialArtifacts = new Map([
-            ['google-cloud-java', 'google-cloud-java'],
-        ]);
-    }
-    /**
-     * Given initial file contents, return updated contents.
-     * @param {string} content The initial content
-     * @returns {string} The updated content
-     */
-    updateContent(content, logger = logger_1.logger) {
-        if (!this.versionsMap) {
-            logger.warn('missing versions map');
-            return content;
-        }
-        // Use yaml package to make sure librarian.yaml is not reformatted because
-        // we use different tool to format librarian.yaml.
-        const doc = yaml.parseDocument(content);
-        if (!doc || doc.errors.length > 0) {
-            logger.warn('Invalid yaml, cannot be parsed');
-            return content;
-        }
-        const libraries = doc.get('libraries');
-        if (!libraries || !yaml.isSeq(libraries)) {
-            return content;
-        }
-        let modified = false;
-        for (const library of libraries.items) {
-            if (!yaml.isMap(library))
-                continue;
-            const artifactID = this.findArtifactID(library.toJSON());
-            if (this.versionsMap.has(artifactID)) {
-                const newVersion = this.versionsMap.get(artifactID);
-                if (newVersion && library.get('version') !== newVersion.toString()) {
-                    library.set('version', newVersion.toString());
-                    modified = true;
-                }
-            }
-        }
-        if (modified) {
-            return doc.toString({ lineWidth: 0 });
-        }
-        return content;
-    }
-    findArtifactID(library) {
-        const artifact = this.specialArtifacts.get(library.name);
-        if (artifact) {
-            return artifact;
-        }
-        if (library.java && library.java.distribution_name_override) {
-            return library.java.distribution_name_override.split(':')[1];
-        }
-        return `google-cloud-${library.name}`;
-    }
-}
-exports.LibrarianYamlUpdater = LibrarianYamlUpdater;
-//# sourceMappingURL=librarian-yaml.js.map
 
 /***/ }),
 
@@ -52702,6 +51388,162 @@ class KRMBlueprintVersion extends default_1.DefaultUpdater {
 }
 exports.KRMBlueprintVersion = KRMBlueprintVersion;
 //# sourceMappingURL=krm-blueprint-version.js.map
+
+/***/ }),
+
+/***/ 55823:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.LibrarianYamlUpdater = void 0;
+const default_1 = __nccwpck_require__(32550);
+const yaml = __nccwpck_require__(38815);
+const logger_1 = __nccwpck_require__(4493);
+/**
+ * Updates a librarian.yaml file.
+ */
+class LibrarianYamlUpdater extends default_1.DefaultUpdater {
+    constructor(options) {
+        super(options);
+        this.specialArtifacts = new Map([
+            ['google-cloud-java', 'google-cloud-java'],
+            ['google-cloud-pom-parent', 'google-cloud-pom-parent'],
+        ]);
+        this.packagePath = options.packagePath;
+        this.component = options.component;
+    }
+    /**
+     * Given initial file contents, return updated contents.
+     * @param {string} content The initial content
+     * @returns {string} The updated content
+     */
+    updateContent(content, _logger = logger_1.logger) {
+        var _a;
+        const doc = yaml.parseDocument(content);
+        if (!doc || doc.errors.length > 0) {
+            throw new Error(`Invalid yaml, cannot be parsed: ${doc.errors
+                .map(e => e.message)
+                .join(', ')}`);
+        }
+        const libraries = doc.get('libraries');
+        if (!libraries || !yaml.isSeq(libraries)) {
+            return content;
+        }
+        let modified = false;
+        for (const library of libraries.items) {
+            if (!yaml.isMap(library))
+                continue;
+            const libraryJSON = library.toJSON();
+            let newVersion = undefined;
+            let isPreview = false;
+            if (this.versionsMap) {
+                // Multi-version (Java style)
+                const artifactID = this.findArtifactID(libraryJSON);
+                if (this.versionsMap.has(artifactID)) {
+                    newVersion = this.versionsMap.get(artifactID);
+                }
+            }
+            else {
+                // Single version (Go, Python, Node style)
+                const isGoPreviewMatch = this.packagePath &&
+                    this.packagePath === `preview/internal/${libraryJSON.name}`;
+                const isPythonPreviewMatch = this.packagePath &&
+                    this.packagePath === `preview-packages/${libraryJSON.name}`;
+                if (isGoPreviewMatch || isPythonPreviewMatch) {
+                    isPreview = true;
+                    newVersion = this.version;
+                }
+                else {
+                    const isGoMatch = (this.packagePath && libraryJSON.name === this.packagePath) ||
+                        ((!this.packagePath || this.packagePath === '.') &&
+                            this.component &&
+                            libraryJSON.name === this.component);
+                    const isPythonNodeMatch = this.packagePath &&
+                        this.deriveOutputDirectory(libraryJSON) === this.packagePath;
+                    if (isGoMatch || isPythonNodeMatch) {
+                        newVersion = this.version;
+                    }
+                }
+            }
+            if (newVersion) {
+                const newVersionStr = newVersion.toString();
+                if (isPreview) {
+                    const previewNode = this.getOrCreateSubsection(library, 'preview', doc);
+                    if (this.updateValue(previewNode, 'version', newVersionStr)) {
+                        modified = true;
+                    }
+                }
+                else {
+                    if (this.updateValue(library, 'version', newVersionStr)) {
+                        modified = true;
+                    }
+                    if (this.versionsMap) {
+                        // Multi-version (Java style): updates released_version for non-SNAPSHOTs
+                        const isSnapshot = !!((_a = newVersion.preRelease) === null || _a === void 0 ? void 0 : _a.includes('SNAPSHOT'));
+                        if (!isSnapshot) {
+                            const javaNode = this.getOrCreateSubsection(library, 'java', doc);
+                            if (this.updateValue(javaNode, 'released_version', newVersionStr)) {
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (modified) {
+            return doc.toString({ lineWidth: 0 });
+        }
+        return content;
+    }
+    deriveOutputDirectory(library) {
+        if (library.output) {
+            return library.output;
+        }
+        return `packages/${library.name}`;
+    }
+    findArtifactID(library) {
+        const artifact = this.specialArtifacts.get(library.name);
+        if (artifact) {
+            return artifact;
+        }
+        if (library.java && library.java.artifact_id) {
+            return library.java.artifact_id;
+        }
+        return `google-cloud-${library.name}`;
+    }
+    getOrCreateSubsection(parent, key, doc) {
+        let section = parent.get(key);
+        if (!yaml.isMap(section)) {
+            section = doc.createNode({});
+            parent.set(key, section);
+        }
+        return section;
+    }
+    updateValue(node, key, value) {
+        if (node.get(key) !== value) {
+            node.set(key, value);
+            return true;
+        }
+        return false;
+    }
+}
+exports.LibrarianYamlUpdater = LibrarianYamlUpdater;
+//# sourceMappingURL=librarian-yaml.js.map
 
 /***/ }),
 
@@ -54291,6 +53133,9 @@ class BranchName {
     toString() {
         return '';
     }
+    isComponent() {
+        return false;
+    }
 }
 exports.BranchName = BranchName;
 /**
@@ -54369,6 +53214,9 @@ class V12ComponentBranchName extends BranchName {
     toString() {
         return `${RELEASE_PLEASE}/branches/${this.targetBranch}/components/${this.component}`;
     }
+    isComponent() {
+        return true;
+    }
 }
 const DEFAULT_PATTERN = `^${RELEASE_PLEASE}--branches--(?<branch>.+)$`;
 class DefaultBranchName extends BranchName {
@@ -54402,6 +53250,9 @@ class ComponentBranchName extends BranchName {
     toString() {
         return `${RELEASE_PLEASE}--branches--${this.targetBranch}--components--${this.component}`;
     }
+    isComponent() {
+        return true;
+    }
 }
 const GROUP_PATTERN = `^${RELEASE_PLEASE}--branches--(?<branch>.+)--groups--(?<group>.+)$`;
 class GroupBranchName extends BranchName {
@@ -54427,6 +53278,757 @@ function safeBranchName(branchName) {
     return branchName.replace(/[^\w\d]/g, '-').replace(/-+/g, '-');
 }
 //# sourceMappingURL=branch-name.js.map
+
+/***/ }),
+
+/***/ 33948:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.addPullRequestDefaults = void 0;
+const DEFAULT_BRANCH_NAME = 'code-suggestions';
+const DEFAULT_PRIMARY_BRANCH = 'main';
+/**
+ * Add defaults to GitHub Pull Request options.
+ * Preserves the empty string.
+ * For ESCMAScript, null/undefined values are preserved for required fields.
+ * Recommended with an object validation function to check empty strings and incorrect types.
+ * @param {PullRequestUserOptions} options the user-provided github pull request options
+ * @returns {CreatePullRequest} git hub context with defaults applied
+ */
+function addPullRequestDefaults(options) {
+    const pullRequestSettings = {
+        upstreamOwner: options.upstreamOwner,
+        upstreamRepo: options.upstreamRepo,
+        description: options.description,
+        title: options.title,
+        message: options.message,
+        force: options.force || false,
+        branch: typeof options.branch === 'string' ? options.branch : DEFAULT_BRANCH_NAME,
+        primary: typeof options.primary === 'string'
+            ? options.primary
+            : DEFAULT_PRIMARY_BRANCH,
+        maintainersCanModify: options.maintainersCanModify === false ? false : true,
+        filesPerCommit: options.filesPerCommit,
+    };
+    return pullRequestSettings;
+}
+exports.addPullRequestDefaults = addPullRequestDefaults;
+//# sourceMappingURL=default-options-handler.js.map
+
+/***/ }),
+
+/***/ 28932:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CommitError = void 0;
+class CommitError extends Error {
+    constructor(message, cause) {
+        super(message);
+        this.cause = cause;
+    }
+}
+exports.CommitError = CommitError;
+//# sourceMappingURL=errors.js.map
+
+/***/ }),
+
+/***/ 65479:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.branch = exports.createBranch = exports.existsBranchWithName = exports.getBranchHead = exports.createRef = void 0;
+const logger_1 = __nccwpck_require__(75960);
+const REF_PREFIX = 'refs/heads/';
+const DEFAULT_PRIMARY_BRANCH = 'main';
+/**
+ * Create a new branch reference with the ref prefix
+ * @param {string} branchName name of the branch
+ */
+function createRef(branchName) {
+    return REF_PREFIX + branchName;
+}
+exports.createRef = createRef;
+/**
+ * get branch commit HEAD SHA of a repository
+ * Throws an error if the branch cannot be found
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} origin The domain information of the remote origin repository
+ * @param {string} branch the name of the branch
+ * @returns {Promise<string>} branch commit HEAD SHA
+ */
+async function getBranchHead(octokit, origin, branch) {
+    const branchData = (await octokit.repos.getBranch({
+        owner: origin.owner,
+        repo: origin.repo,
+        branch,
+    })).data;
+    logger_1.logger.info(`Successfully found branch HEAD sha "${branchData.commit.sha}".`);
+    return branchData.commit.sha;
+}
+exports.getBranchHead = getBranchHead;
+/**
+ * Determine if there is a branch with the provided name in the remote GitHub repository
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} remote The domain information of the remote repository
+ * @param {string} name The branch name to create on the repository
+ * @returns {Promise<boolean>} if there is a branch already existing in the remote GitHub repository
+ */
+async function existsBranchWithName(octokit, remote, name) {
+    try {
+        const data = (await octokit.git.getRef({
+            owner: remote.owner,
+            repo: remote.repo,
+            ref: `heads/${name}`,
+        })).data;
+        return data.ref ? true : false;
+    }
+    catch (err) {
+        if (err.status === 404)
+            return false;
+        else
+            throw err;
+    }
+}
+exports.existsBranchWithName = existsBranchWithName;
+/**
+ * Create a branch on the remote repository if there is not an existing branch
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} remote The domain information of the remote origin repository
+ * @param {string} name The branch name to create on the origin repository
+ * @param {string} baseSha the sha that the base of the reference points to
+ * @param {boolean} duplicate whether there is an existing branch or not
+ * @returns {Promise<void>}
+ */
+async function createBranch(octokit, remote, name, baseSha, duplicate) {
+    if (!duplicate) {
+        const refData = (await octokit.git.createRef({
+            owner: remote.owner,
+            repo: remote.repo,
+            ref: createRef(name),
+            sha: baseSha,
+        })).data;
+        logger_1.logger.info(`Successfully created branch at ${refData.url}`);
+    }
+    else {
+        logger_1.logger.info('Skipping branch creation step...');
+    }
+}
+exports.createBranch = createBranch;
+/**
+ * Create a GitHub branch given a remote origin.
+ * Throws an exception if octokit fails, or if the base branch is invalid
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} origin The domain information of the remote origin repository
+ * @param {RepoDomain} upstream The domain information of the remote upstream repository
+ * @param {string} name The branch name to create on the origin repository
+ * @param {string} baseBranch the name of the branch to base the new branch off of. Default is main
+ * @returns {Promise<string>} the base SHA for subsequent commits to be based off for the origin branch
+ */
+async function branch(octokit, origin, upstream, name, baseBranch = DEFAULT_PRIMARY_BRANCH) {
+    // create branch from primary branch HEAD SHA
+    try {
+        const baseSha = await getBranchHead(octokit, upstream, baseBranch);
+        const duplicate = await existsBranchWithName(octokit, origin, name);
+        await createBranch(octokit, origin, name, baseSha, duplicate);
+        return baseSha;
+    }
+    catch (err) {
+        logger_1.logger.error('Error when creating branch');
+        throw err;
+    }
+}
+exports.branch = branch;
+//# sourceMappingURL=branch.js.map
+
+/***/ }),
+
+/***/ 52775:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.commitAndPush = exports.updateRef = exports.createTree = exports.generateTreeObjects = void 0;
+const logger_1 = __nccwpck_require__(75960);
+const create_commit_1 = __nccwpck_require__(30845);
+const errors_1 = __nccwpck_require__(28932);
+const DEFAULT_FILES_PER_COMMIT = 100;
+/**
+ * Generate and return a GitHub tree object structure
+ * containing the target change data
+ * See https://developer.github.com/v3/git/trees/#tree-object
+ * @param {Changes} changes the set of repository changes
+ * @returns {TreeObject[]} The new GitHub changes
+ */
+function generateTreeObjects(changes) {
+    const tree = [];
+    changes.forEach((fileData, path) => {
+        if (fileData.content === null) {
+            // if no file content then file is deleted
+            tree.push({
+                path,
+                mode: fileData.mode,
+                type: 'blob',
+                sha: null,
+            });
+        }
+        else {
+            // update file with its content
+            tree.push({
+                path,
+                mode: fileData.mode,
+                type: 'blob',
+                content: fileData.content,
+            });
+        }
+    });
+    return tree;
+}
+exports.generateTreeObjects = generateTreeObjects;
+function* inGroupsOf(all, groupSize) {
+    for (let i = 0; i < all.length; i += groupSize) {
+        yield all.slice(i, i + groupSize);
+    }
+}
+/**
+ * Upload and create a remote GitHub tree
+ * and resolves with the new tree SHA.
+ * Rejects if GitHub V3 API fails with the GitHub error response
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} origin the the remote repository to push changes to
+ * @param {string} refHead the base of the new commit(s)
+ * @param {TreeObject[]} tree the set of GitHub changes to upload
+ * @returns {Promise<string>} the GitHub tree SHA
+ * @throws {CommitError}
+ */
+async function createTree(octokit, origin, refHead, tree) {
+    const oldTreeSha = (await octokit.git.getCommit({
+        owner: origin.owner,
+        repo: origin.repo,
+        commit_sha: refHead,
+    })).data.tree.sha;
+    logger_1.logger.info('Got the latest commit tree');
+    try {
+        const treeSha = (await octokit.git.createTree({
+            owner: origin.owner,
+            repo: origin.repo,
+            tree,
+            base_tree: oldTreeSha,
+        })).data.sha;
+        logger_1.logger.info(`Successfully created a tree with the desired changes with SHA ${treeSha}`);
+        return treeSha;
+    }
+    catch (e) {
+        throw new errors_1.CommitError(`Error adding to tree: ${refHead}`, e);
+    }
+}
+exports.createTree = createTree;
+/**
+ * Update a reference to a SHA
+ * Rejects if GitHub V3 API fails with the GitHub error response
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {BranchDomain} origin the the remote branch to push changes to
+ * @param {string} newSha the ref to update the commit HEAD to
+ * @param {boolean} force to force the commit changes given refHead
+ * @returns {Promise<void>}
+ */
+async function updateRef(octokit, origin, newSha, force) {
+    logger_1.logger.info(`Updating reference heads/${origin.branch} to ${newSha}`);
+    try {
+        await octokit.git.updateRef({
+            owner: origin.owner,
+            repo: origin.repo,
+            ref: `heads/${origin.branch}`,
+            sha: newSha,
+            force,
+        });
+        logger_1.logger.info(`Successfully updated reference ${origin.branch} to ${newSha}`);
+    }
+    catch (e) {
+        throw new errors_1.CommitError(`Error updating ref heads/${origin.branch} to ${newSha}`, e);
+    }
+}
+exports.updateRef = updateRef;
+/**
+ * Given a set of changes, apply the commit(s) on top of the given branch's head and upload it to GitHub
+ * Rejects if GitHub V3 API fails with the GitHub error response
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {string} refHead the base of the new commit(s)
+ * @param {Changes} changes the set of repository changes
+ * @param {RepoDomain} origin the the remote repository to push changes to
+ * @param {string} originBranchName the remote branch that will contain the new changes
+ * @param {string} commitMessage the message of the new commit
+ * @param {boolean} force to force the commit changes given refHead
+ * @returns {Promise<void>}
+ * @throws {CommitError}
+ */
+async function commitAndPush(octokit, refHead, changes, originBranch, commitMessage, force, options) {
+    var _a;
+    const filesPerCommit = (_a = options === null || options === void 0 ? void 0 : options.filesPerCommit) !== null && _a !== void 0 ? _a : DEFAULT_FILES_PER_COMMIT;
+    const tree = generateTreeObjects(changes);
+    for (const treeGroup of inGroupsOf(tree, filesPerCommit)) {
+        const treeSha = await createTree(octokit, originBranch, refHead, treeGroup);
+        refHead = await (0, create_commit_1.createCommit)(octokit, originBranch, refHead, treeSha, commitMessage, options);
+    }
+    await updateRef(octokit, originBranch, refHead, force);
+}
+exports.commitAndPush = commitAndPush;
+//# sourceMappingURL=commit-and-push.js.map
+
+/***/ }),
+
+/***/ 30845:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.createCommit = void 0;
+const logger_1 = __nccwpck_require__(75960);
+const errors_1 = __nccwpck_require__(28932);
+/**
+ * Create a commit with a repo snapshot SHA on top of the reference HEAD
+ * and resolves with the SHA of the commit.
+ * Rejects if GitHub V3 API fails with the GitHub error response
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} origin the the remote repository to push changes to
+ * @param {string} refHead the base of the new commit(s)
+ * @param {string} treeSha the tree SHA that this commit will point to
+ * @param {string} message the message of the new commit
+ * @returns {Promise<string>} the new commit SHA
+ * @see https://docs.github.com/en/rest/git/commits?apiVersion=2022-11-28#create-a-commit
+ */
+async function createCommit(octokit, origin, refHead, treeSha, message, options = {}) {
+    try {
+        const signature = options.signer
+            ? await options.signer.generateSignature({
+                message,
+                tree: treeSha,
+                parents: [refHead],
+                author: options.author,
+                committer: options.committer,
+            })
+            : undefined;
+        const { data: { sha, url }, } = await octokit.git.createCommit({
+            owner: origin.owner,
+            repo: origin.repo,
+            message,
+            tree: treeSha,
+            parents: [refHead],
+            signature,
+            author: options.author,
+            committer: options.committer,
+        });
+        logger_1.logger.info(`Successfully created commit. See commit at ${url}`);
+        return sha;
+    }
+    catch (e) {
+        throw new errors_1.CommitError(`Error creating commit for: ${treeSha}`, e);
+    }
+}
+exports.createCommit = createCommit;
+//# sourceMappingURL=create-commit.js.map
+
+/***/ }),
+
+/***/ 9107:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.fork = void 0;
+const logger_1 = __nccwpck_require__(75960);
+/**
+ * Fork the GitHub owner's repository.
+ * Returns the fork owner and fork repo when the fork creation request to GitHub succeeds.
+ * Otherwise throws error.
+ *
+ * If fork already exists no new fork is created, no error occurs, and the existing Fork data is returned
+ * with the `updated_at` + any historical repo changes.
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} upstream upstream repository information
+ * @returns {Promise<RepoDomain>} the forked repository name, as well as the owner of that fork
+ */
+async function fork(octokit, upstream) {
+    try {
+        const forkedRepo = (await octokit.repos.createFork({
+            owner: upstream.owner,
+            repo: upstream.repo,
+        })).data;
+        const origin = {
+            repo: forkedRepo.name,
+            owner: forkedRepo.owner.login,
+        };
+        logger_1.logger.info(`Create fork request was successful for ${origin.owner}/${origin.repo}`);
+        return origin;
+    }
+    catch (err) {
+        logger_1.logger.error('Error when forking');
+        throw err;
+    }
+}
+exports.fork = fork;
+//# sourceMappingURL=fork.js.map
+
+/***/ }),
+
+/***/ 6284:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.addLabels = void 0;
+const logger_1 = __nccwpck_require__(75960);
+/**
+ * Create a GitHub PR on the upstream organization's repo
+ * Throws an error if the GitHub API fails
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} upstream The upstream repository
+ * @param {BranchDomain} origin The remote origin information that contains the origin branch
+ * @param {number} issue_number The issue number to add labels to. Can also be a PR number
+ * @param {string[]} labels The list of labels to apply to the newly created PR. Default is []. the funciton will no-op.
+ * @returns {Promise<string[]>} The list of resulting labels after the addition of the given labels
+ */
+async function addLabels(octokit, upstream, origin, issue_number, labels) {
+    if (!labels || labels.length === 0) {
+        return [];
+    }
+    const labelsResponseData = (await octokit.issues.addLabels({
+        owner: upstream.owner,
+        repo: origin.repo,
+        issue_number: issue_number,
+        labels: labels,
+    })).data;
+    logger_1.logger.info(`Successfully added labels ${labels} to issue: ${issue_number}`);
+    return labelsResponseData.map(l => l.name);
+}
+exports.addLabels = addLabels;
+//# sourceMappingURL=labels.js.map
+
+/***/ }),
+
+/***/ 39855:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.openPullRequest = void 0;
+const logger_1 = __nccwpck_require__(75960);
+const DEFAULT_PRIMARY = 'main';
+/**
+ * Create a GitHub PR on the upstream organization's repo
+ * Throws an error if the GitHub API fails
+ * @param {Octokit} octokit The authenticated octokit instance
+ * @param {RepoDomain} upstream The upstream repository
+ * @param {BranchDomain} origin The remote origin information that contains the origin branch
+ * @param {Description} description The pull request title and detailed description
+ * @param {boolean} maintainersCanModify Whether or not maintainers can modify the pull request. Default is true
+ * @param {string} upstreamPrimary The upstream repository's primary branch. Default is main.
+ * @param draft Open a DRAFT pull request.  Defaults to false.
+ * @returns {Promise<void>}
+ */
+async function openPullRequest(octokit, upstream, origin, description, maintainersCanModify = true, upstreamPrimary = DEFAULT_PRIMARY, draft = false) {
+    const head = `${origin.owner}:${origin.branch}`;
+    const existingPullRequest = (await octokit.pulls.list({
+        owner: upstream.owner,
+        repo: origin.repo,
+        head,
+    })).data.find(pr => pr.head.label === head);
+    if (existingPullRequest) {
+        logger_1.logger.info(`Found existing pull request for reference ${origin.owner}:${origin.branch}. Skipping creating a new pull request.`);
+        return existingPullRequest.number;
+    }
+    const pullResponseData = (await octokit.pulls.create({
+        owner: upstream.owner,
+        repo: origin.repo,
+        title: description.title,
+        head: `${origin.owner}:${origin.branch}`,
+        base: upstreamPrimary,
+        body: description.body,
+        maintainer_can_modify: maintainersCanModify,
+        draft: draft,
+    })).data;
+    logger_1.logger.info(`Successfully opened pull request available at url: ${pullResponseData.url}.`);
+    return pullResponseData.number;
+}
+exports.openPullRequest = openPullRequest;
+//# sourceMappingURL=open-pull-request.js.map
+
+/***/ }),
+
+/***/ 53579:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.createPullRequest = void 0;
+const logger_1 = __nccwpck_require__(75960);
+const default_options_handler_1 = __nccwpck_require__(33948);
+const retry = __nccwpck_require__(45195);
+const branch_1 = __nccwpck_require__(65479);
+const fork_1 = __nccwpck_require__(9107);
+const commit_and_push_1 = __nccwpck_require__(52775);
+const open_pull_request_1 = __nccwpck_require__(39855);
+const labels_1 = __nccwpck_require__(6284);
+/**
+ * Make a new GitHub Pull Request with a set of changes applied on top of primary branch HEAD.
+ * The changes are committed into a new branch based on the upstream repository options using the authenticated Octokit account.
+ * Then a Pull Request is made from that branch.
+ *
+ * Also throws error if git data from the fork is not ready in 5 minutes.
+ *
+ * From the docs
+ * https://developer.github.com/v3/repos/forks/#create-a-fork
+ * """
+ * Forking a Repository happens asynchronously.
+ * You may have to wait a short period of time before you can access the git objects.
+ * If this takes longer than 5 minutes, be sure to contact GitHub Support or GitHub Premium Support.
+ * """
+ *
+ * If changes are empty then the workflow will not run.
+ * Rethrows an HttpError if Octokit GitHub API returns an error. HttpError Octokit access_token and client_secret headers redact all sensitive information.
+ * @param {Octokit} octokit The authenticated octokit instance, instantiated with an access token having permissiong to create a fork on the target repository
+ * @param {Changes | null | undefined} changes A set of changes. The changes may be empty
+ * @param {CreatePullRequestUserOptions} options The configuration for interacting with GitHub provided by the user.
+ * @returns {Promise<number>} the pull request number. Returns 0 if unsuccessful.
+ * @throws {CommitError} on failure during commit process
+ */
+async function createPullRequest(octokit, changes, options) {
+    (0, logger_1.setupLogger)(options.logger);
+    // if null undefined, or the empty map then no changes have been provided.
+    // Do not execute GitHub workflow
+    if (changes === null || changes === undefined || changes.size === 0) {
+        logger_1.logger.info('Empty change set provided. No changes need to be made. Cancelling workflow.');
+        return 0;
+    }
+    const gitHubConfigs = (0, default_options_handler_1.addPullRequestDefaults)(options);
+    logger_1.logger.info('Starting GitHub PR workflow...');
+    const upstream = {
+        owner: gitHubConfigs.upstreamOwner,
+        repo: gitHubConfigs.upstreamRepo,
+    };
+    const origin = options.fork === false ? upstream : await (0, fork_1.fork)(octokit, upstream);
+    if (options.fork) {
+        // try to sync the fork
+        await retry(async () => await octokit.repos.mergeUpstream({
+            owner: origin.owner,
+            repo: origin.repo,
+            branch: gitHubConfigs.primary,
+        }), {
+            retries: options.retry,
+            factor: 2.8411,
+            minTimeout: 3000,
+            randomize: false,
+            onRetry: (e, attempt) => {
+                e.message = `Error creating syncing upstream: ${e.message}`;
+                logger_1.logger.error(e);
+                logger_1.logger.info(`Retry attempt #${attempt}...`);
+            },
+        });
+    }
+    const originBranch = {
+        ...origin,
+        branch: gitHubConfigs.branch,
+    };
+    // The `retry` flag defaults to `5` to maintain compatibility
+    options.retry = options.retry === undefined ? 5 : options.retry;
+    const refHeadSha = await retry(async () => await (0, branch_1.branch)(octokit, origin, upstream, originBranch.branch, gitHubConfigs.primary), {
+        retries: options.retry,
+        factor: 2.8411,
+        minTimeout: 3000,
+        randomize: false,
+        onRetry: (e, attempt) => {
+            e.message = `Error creating Pull Request: ${e.message}`;
+            logger_1.logger.error(e);
+            logger_1.logger.info(`Retry attempt #${attempt}...`);
+        },
+    });
+    await (0, commit_and_push_1.commitAndPush)(octokit, refHeadSha, changes, originBranch, gitHubConfigs.message, gitHubConfigs.force, options);
+    const description = {
+        body: gitHubConfigs.description,
+        title: gitHubConfigs.title,
+    };
+    const prNumber = await (0, open_pull_request_1.openPullRequest)(octokit, upstream, originBranch, description, gitHubConfigs.maintainersCanModify, gitHubConfigs.primary, options.draft);
+    logger_1.logger.info(`Successfully opened pull request: ${prNumber}.`);
+    // addLabels will no-op if options.labels is undefined or empty.
+    await (0, labels_1.addLabels)(octokit, upstream, originBranch, prNumber, options.labels);
+    return prNumber;
+}
+exports.createPullRequest = createPullRequest;
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 75960:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.setupLogger = exports.logger = void 0;
+class NullLogger {
+    constructor() {
+        this.error = () => { };
+        this.warn = () => { };
+        this.info = () => { };
+        this.debug = () => { };
+        this.trace = () => { };
+    }
+}
+let logger = new NullLogger();
+exports.logger = logger;
+function setupLogger(userLogger) {
+    if (userLogger) {
+        exports.logger = logger = userLogger;
+    }
+    else {
+        exports.logger = logger = new NullLogger();
+    }
+}
+exports.setupLogger = setupLogger;
+//# sourceMappingURL=logger.js.map
 
 /***/ }),
 
@@ -55113,10 +54715,10 @@ function generateMatchPattern(pullRequestTitlePattern, componentNoSpace, logger 
         pullRequestTitlePattern.search(/\$\{version\}/) === -1)
         logger.warn("pullRequestTitlePattern miss the part of '${version}'");
     return new RegExp(`^${(pullRequestTitlePattern || DEFAULT_PR_TITLE_PATTERN)
-        .replace('[', '\\[') // TODO: handle all regex escaping
-        .replace(']', '\\]')
-        .replace('(', '\\(')
-        .replace(')', '\\)')
+        .replace(/\[/g, '\\[') // TODO: handle all regex escaping
+        .replace(/\]/g, '\\]')
+        .replace(/\(/g, '\\(')
+        .replace(/\)/g, '\\)')
         .replace('${scope}', '(\\((?<branch>[\\w-./]+)\\))?')
         .replace('${component}', componentNoSpace === true
         ? '?(?<component>@?[\\w-./]*)?'
@@ -92398,7 +92000,7 @@ exports.range = range;
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.EXPANSION_MAX = void 0;
+exports.EXPANSION_MAX_LENGTH = exports.EXPANSION_MAX = void 0;
 exports.expand = expand;
 const balanced_match_1 = __nccwpck_require__(95319);
 const escSlash = '\0SLASH' + Math.random() + '\0';
@@ -92417,6 +92019,17 @@ const closePattern = /\\}/g;
 const commaPattern = /\\,/g;
 const periodPattern = /\\\./g;
 exports.EXPANSION_MAX = 100_000;
+// `EXPANSION_MAX` caps the *number* of expansions, but not their length. An
+// input like `'{a,b}'.repeat(1500)` stays under that count - its output is
+// truncated to 100k results - while making every result ~1500 characters
+// long. The result set, and the intermediate arrays built while combining
+// brace sets, then grow large enough to exhaust memory and crash the process
+// (CVE-2026-14257). `EXPANSION_MAX_LENGTH` bounds the total number of
+// characters the accumulator may hold at any point, so memory stays flat no
+// matter how many brace groups are chained. The limit sits well above any
+// realistic expansion (100k results hitting `EXPANSION_MAX` measure ~1M
+// characters) so legitimate input is unaffected.
+exports.EXPANSION_MAX_LENGTH = 4_000_000;
 function numeric(str) {
     return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
 }
@@ -92466,7 +92079,7 @@ function expand(str, options = {}) {
     if (!str) {
         return [];
     }
-    const { max = exports.EXPANSION_MAX } = options;
+    const { max = exports.EXPANSION_MAX, maxLength = exports.EXPANSION_MAX_LENGTH } = options;
     // I don't know why Bash 4.3 does this, but it does.
     // Anything starting with {} will have the first two bytes preserved
     // but *only* at the top level, so {},a}b will not expand to anything,
@@ -92476,7 +92089,7 @@ function expand(str, options = {}) {
     if (str.slice(0, 2) === '{}') {
         str = '\\{\\}' + str.slice(2);
     }
-    return expand_(escapeBraces(str), max, true).map(unescapeBraces);
+    return expand_(escapeBraces(str), max, maxLength, true).map(unescapeBraces);
 }
 function embrace(str) {
     return '{' + str + '}';
@@ -92490,22 +92103,117 @@ function lte(i, y) {
 function gte(i, y) {
     return i >= y;
 }
-function expand_(str, max, isTop) {
-    /** @type {string[]} */
-    const expansions = [];
-    const m = (0, balanced_match_1.balanced)('{', '}', str);
-    if (!m)
-        return [str];
-    // no need to expand pre, since it is guaranteed to be free of brace-sets
-    const pre = m.pre;
-    const post = m.post.length ? expand_(m.post, max, false) : [''];
-    if (/\$$/.test(m.pre)) {
-        for (let k = 0; k < post.length && k < max; k++) {
-            const expansion = pre + '{' + m.body + '}' + post[k];
-            expansions.push(expansion);
+// Build `{ acc[a] + pre + values[v] }` for every combination, capping the
+// number of results at `max` and the total number of characters at `maxLength`.
+// This is the one place output grows, so bounding it here keeps the single
+// accumulator - and therefore memory - flat regardless of how many brace groups
+// are combined (CVE-2026-14257).
+function combine(acc, pre, values, max, maxLength, dropEmpties) {
+    const out = [];
+    let length = 0;
+    for (let a = 0; a < acc.length; a++) {
+        for (let v = 0; v < values.length; v++) {
+            if (out.length >= max)
+                return out;
+            const expansion = acc[a] + pre + values[v];
+            // Bash drops empty results at the top level. Skip them before they count
+            // against `max`, so `max` bounds the number of *kept* results.
+            if (dropEmpties && !expansion)
+                continue;
+            if (length + expansion.length > maxLength)
+                return out;
+            out.push(expansion);
+            length += expansion.length;
         }
     }
-    else {
+    return out;
+}
+// The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
+// sequence body.
+function expandSequence(body, isAlphaSequence, max, maxLength) {
+    const n = body.split(/\.\./);
+    const N = [];
+    // A sequence body always splits into two or three parts, but the compiler
+    // can't know that.
+    /* c8 ignore start */
+    if (n[0] === undefined || n[1] === undefined) {
+        return N;
+    }
+    /* c8 ignore stop */
+    const x = numeric(n[0]);
+    const y = numeric(n[1]);
+    const width = Math.max(n[0].length, n[1].length);
+    let incr = n.length === 3 && n[2] !== undefined ?
+        Math.max(Math.abs(numeric(n[2])), 1)
+        : 1;
+    let test = lte;
+    const reverse = y < x;
+    if (reverse) {
+        incr *= -1;
+        test = gte;
+    }
+    const pad = n.some(isPadded);
+    let length = 0;
+    for (let i = x; test(i, y) && N.length < max; i += incr) {
+        let c;
+        if (isAlphaSequence) {
+            c = String.fromCharCode(i);
+            if (c === '\\') {
+                c = '';
+            }
+        }
+        else {
+            c = String(i);
+            if (pad) {
+                const need = width - c.length;
+                if (need > 0) {
+                    const z = new Array(need + 1).join('0');
+                    if (i < 0) {
+                        c = '-' + z + c.slice(1);
+                    }
+                    else {
+                        c = z + c;
+                    }
+                }
+            }
+        }
+        if (length + c.length > maxLength)
+            break;
+        N.push(c);
+        length += c.length;
+    }
+    return N;
+}
+function expand_(str, max, maxLength, isTop) {
+    // Consume the string's top-level brace groups left to right, threading a
+    // running set of combined prefixes (`acc`). Expanding the tail iteratively -
+    // rather than recursing on `m.post` once per group - keeps the native stack
+    // depth constant, so deeply chained input (`'{a,b}'.repeat(3000)`) can no
+    // longer overflow the stack, and leaves a single accumulator whose size
+    // `maxLength` bounds directly (CVE-2026-14257).
+    let acc = [''];
+    // Bash drops empty results, but only when the *first* top-level group is a
+    // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
+    // is on the final strings, so it is applied to whichever `combine` produces
+    // them (the one with no brace set left in the tail).
+    let dropEmpties = false;
+    let firstGroup = true;
+    for (;;) {
+        const m = (0, balanced_match_1.balanced)('{', '}', str);
+        // No brace set left: the rest of the string is literal.
+        if (!m) {
+            return combine(acc, str, [''], max, maxLength, dropEmpties);
+        }
+        // no need to expand pre, since it is guaranteed to be free of brace-sets
+        const pre = m.pre;
+        if (/\$$/.test(pre)) {
+            acc = combine(acc, pre + '{' + m.body + '}', [''], max, maxLength, dropEmpties && !m.post.length);
+            firstGroup = false;
+            if (!m.post.length)
+                break;
+            str = m.post;
+            continue;
+        }
         const isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
         const isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
         const isSequence = isNumericSequence || isAlphaSequence;
@@ -92514,87 +92222,69 @@ function expand_(str, max, isTop) {
             // {a},b}
             if (m.post.match(/,(?!,).*\}/)) {
                 str = m.pre + '{' + m.body + escClose + m.post;
-                return expand_(str, max, true);
+                isTop = true;
+                continue;
             }
-            return [str];
+            // Nothing here expands, so the whole remaining string is literal.
+            return combine(acc, pre + '{' + m.body + '}' + m.post, [''], max, maxLength, dropEmpties);
         }
-        let n;
+        if (firstGroup) {
+            dropEmpties = isTop && !isSequence;
+            firstGroup = false;
+        }
+        let values;
         if (isSequence) {
-            n = m.body.split(/\.\./);
+            values = expandSequence(m.body, isAlphaSequence, max, maxLength);
         }
         else {
-            n = parseCommaParts(m.body);
+            let n = parseCommaParts(m.body);
             if (n.length === 1 && n[0] !== undefined) {
                 // x{{a,b}}y ==> x{a}y x{b}y
-                n = expand_(n[0], max, false).map(embrace);
+                n = expand_(n[0], max, maxLength, false).map(embrace);
                 //XXX is this necessary? Can't seem to hit it in tests.
                 /* c8 ignore start */
                 if (n.length === 1) {
-                    return post.map(p => m.pre + n[0] + p);
+                    acc = combine(acc, pre + n[0], [''], max, maxLength, dropEmpties && !m.post.length);
+                    if (!m.post.length)
+                        break;
+                    str = m.post;
+                    continue;
                 }
                 /* c8 ignore stop */
             }
-        }
-        // at this point, n is the parts, and we know it's not a comma set
-        // with a single entry.
-        let N;
-        if (isSequence && n[0] !== undefined && n[1] !== undefined) {
-            const x = numeric(n[0]);
-            const y = numeric(n[1]);
-            const width = Math.max(n[0].length, n[1].length);
-            let incr = n.length === 3 && n[2] !== undefined ?
-                Math.max(Math.abs(numeric(n[2])), 1)
-                : 1;
-            let test = lte;
-            const reverse = y < x;
-            if (reverse) {
-                incr *= -1;
-                test = gte;
+            // Values that `combine` is going to drop as empty produce no result, so
+            // they must not count against `max` - otherwise `{a,,b}` with `max: 2`
+            // would stop at `['a', '']` and yield one result instead of two. Skipping
+            // them outright keeps `values` bounded while leaving `max` a bound on
+            // *kept* results.
+            let dropsEmpties = dropEmpties && !m.post.length && !pre;
+            for (let d = 0; dropsEmpties && d < acc.length; d++) {
+                if (acc[d]) {
+                    dropsEmpties = false;
+                }
             }
-            const pad = n.some(isPadded);
-            N = [];
-            for (let i = x; test(i, y); i += incr) {
-                let c;
-                if (isAlphaSequence) {
-                    c = String.fromCharCode(i);
-                    if (c === '\\') {
-                        c = '';
+            values = [];
+            let valuesLength = 0;
+            outer: for (let j = 0; j < n.length; j++) {
+                const expanded = expand_(n[j], max, maxLength, false);
+                for (let k = 0; k < expanded.length; k++) {
+                    const v = expanded[k];
+                    if (dropsEmpties && !v)
+                        continue;
+                    if (values.length >= max || valuesLength + v.length > maxLength) {
+                        break outer;
                     }
-                }
-                else {
-                    c = String(i);
-                    if (pad) {
-                        const need = width - c.length;
-                        if (need > 0) {
-                            const z = new Array(need + 1).join('0');
-                            if (i < 0) {
-                                c = '-' + z + c.slice(1);
-                            }
-                            else {
-                                c = z + c;
-                            }
-                        }
-                    }
-                }
-                N.push(c);
-            }
-        }
-        else {
-            N = [];
-            for (let j = 0; j < n.length; j++) {
-                N.push.apply(N, expand_(n[j], max, false));
-            }
-        }
-        for (let j = 0; j < N.length; j++) {
-            for (let k = 0; k < post.length && expansions.length < max; k++) {
-                const expansion = pre + N[j] + post[k];
-                if (!isTop || isSequence || expansion) {
-                    expansions.push(expansion);
+                    values.push(v);
+                    valuesLength += v.length;
                 }
             }
         }
+        acc = combine(acc, pre, values, max, maxLength, dropEmpties && !m.post.length);
+        if (!m.post.length)
+            break;
+        str = m.post;
     }
-    return expansions;
+    return acc;
 }
 //# sourceMappingURL=index.js.map
 
@@ -94843,2246 +94533,6 @@ const unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true, } = {
 };
 exports.unescape = unescape;
 //# sourceMappingURL=unescape.js.map
-
-/***/ }),
-
-/***/ 13878:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.convertChangesToDMP = convertChangesToDMP;
-/**
- * converts a list of change objects to the format returned by Google's [diff-match-patch](https://github.com/google/diff-match-patch) library
- */
-function convertChangesToDMP(changes) {
-    var ret = [];
-    var change, operation;
-    for (var i = 0; i < changes.length; i++) {
-        change = changes[i];
-        if (change.added) {
-            operation = 1;
-        }
-        else if (change.removed) {
-            operation = -1;
-        }
-        else {
-            operation = 0;
-        }
-        ret.push([operation, change.value]);
-    }
-    return ret;
-}
-
-
-/***/ }),
-
-/***/ 85222:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.convertChangesToXML = convertChangesToXML;
-/**
- * converts a list of change objects to a serialized XML format
- */
-function convertChangesToXML(changes) {
-    var ret = [];
-    for (var i = 0; i < changes.length; i++) {
-        var change = changes[i];
-        if (change.added) {
-            ret.push('<ins>');
-        }
-        else if (change.removed) {
-            ret.push('<del>');
-        }
-        ret.push(escapeHTML(change.value));
-        if (change.added) {
-            ret.push('</ins>');
-        }
-        else if (change.removed) {
-            ret.push('</del>');
-        }
-    }
-    return ret.join('');
-}
-function escapeHTML(s) {
-    var n = s;
-    n = n.replace(/&/g, '&amp;');
-    n = n.replace(/</g, '&lt;');
-    n = n.replace(/>/g, '&gt;');
-    n = n.replace(/"/g, '&quot;');
-    return n;
-}
-
-
-/***/ }),
-
-/***/ 51898:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = function (d, b) {
-        extendStatics = Object.setPrototypeOf ||
-            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
-        return extendStatics(d, b);
-    };
-    return function (d, b) {
-        if (typeof b !== "function" && b !== null)
-            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.arrayDiff = void 0;
-exports.diffArrays = diffArrays;
-var base_js_1 = __nccwpck_require__(37922);
-var ArrayDiff = /** @class */ (function (_super) {
-    __extends(ArrayDiff, _super);
-    function ArrayDiff() {
-        return _super !== null && _super.apply(this, arguments) || this;
-    }
-    ArrayDiff.prototype.tokenize = function (value) {
-        return value.slice();
-    };
-    ArrayDiff.prototype.join = function (value) {
-        return value;
-    };
-    ArrayDiff.prototype.removeEmpty = function (value) {
-        return value;
-    };
-    return ArrayDiff;
-}(base_js_1.default));
-exports.arrayDiff = new ArrayDiff();
-function diffArrays(oldArr, newArr, options) {
-    return exports.arrayDiff.diff(oldArr, newArr, options);
-}
-
-
-/***/ }),
-
-/***/ 37922:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-var Diff = /** @class */ (function () {
-    function Diff() {
-    }
-    Diff.prototype.diff = function (oldStr, newStr, 
-    // Type below is not accurate/complete - see above for full possibilities - but it compiles
-    options) {
-        if (options === void 0) { options = {}; }
-        var callback;
-        if (typeof options === 'function') {
-            callback = options;
-            options = {};
-        }
-        else if ('callback' in options) {
-            callback = options.callback;
-        }
-        // Allow subclasses to massage the input prior to running
-        var oldString = this.castInput(oldStr, options);
-        var newString = this.castInput(newStr, options);
-        var oldTokens = this.removeEmpty(this.tokenize(oldString, options));
-        var newTokens = this.removeEmpty(this.tokenize(newString, options));
-        return this.diffWithOptionsObj(oldTokens, newTokens, options, callback);
-    };
-    Diff.prototype.diffWithOptionsObj = function (oldTokens, newTokens, options, callback) {
-        var _this = this;
-        var _a;
-        var done = function (value) {
-            value = _this.postProcess(value, options);
-            if (callback) {
-                setTimeout(function () { callback(value); }, 0);
-                return undefined;
-            }
-            else {
-                return value;
-            }
-        };
-        var newLen = newTokens.length, oldLen = oldTokens.length;
-        var editLength = 1;
-        var maxEditLength = newLen + oldLen;
-        if (options.maxEditLength != null) {
-            maxEditLength = Math.min(maxEditLength, options.maxEditLength);
-        }
-        var maxExecutionTime = (_a = options.timeout) !== null && _a !== void 0 ? _a : Infinity;
-        var abortAfterTimestamp = Date.now() + maxExecutionTime;
-        var bestPath = [{ oldPos: -1, lastComponent: undefined }];
-        // Seed editLength = 0, i.e. the content starts with the same values
-        var newPos = this.extractCommon(bestPath[0], newTokens, oldTokens, 0, options);
-        if (bestPath[0].oldPos + 1 >= oldLen && newPos + 1 >= newLen) {
-            // Identity per the equality and tokenizer
-            return done(this.buildValues(bestPath[0].lastComponent, newTokens, oldTokens));
-        }
-        // Once we hit the right edge of the edit graph on some diagonal k, we can
-        // definitely reach the end of the edit graph in no more than k edits, so
-        // there's no point in considering any moves to diagonal k+1 any more (from
-        // which we're guaranteed to need at least k+1 more edits).
-        // Similarly, once we've reached the bottom of the edit graph, there's no
-        // point considering moves to lower diagonals.
-        // We record this fact by setting minDiagonalToConsider and
-        // maxDiagonalToConsider to some finite value once we've hit the edge of
-        // the edit graph.
-        // This optimization is not faithful to the original algorithm presented in
-        // Myers's paper, which instead pointlessly extends D-paths off the end of
-        // the edit graph - see page 7 of Myers's paper which notes this point
-        // explicitly and illustrates it with a diagram. This has major performance
-        // implications for some common scenarios. For instance, to compute a diff
-        // where the new text simply appends d characters on the end of the
-        // original text of length n, the true Myers algorithm will take O(n+d^2)
-        // time while this optimization needs only O(n+d) time.
-        var minDiagonalToConsider = -Infinity, maxDiagonalToConsider = Infinity;
-        // Main worker method. checks all permutations of a given edit length for acceptance.
-        var execEditLength = function () {
-            for (var diagonalPath = Math.max(minDiagonalToConsider, -editLength); diagonalPath <= Math.min(maxDiagonalToConsider, editLength); diagonalPath += 2) {
-                var basePath = void 0;
-                var removePath = bestPath[diagonalPath - 1], addPath = bestPath[diagonalPath + 1];
-                if (removePath) {
-                    // No one else is going to attempt to use this value, clear it
-                    // @ts-expect-error - perf optimisation. This type-violating value will never be read.
-                    bestPath[diagonalPath - 1] = undefined;
-                }
-                var canAdd = false;
-                if (addPath) {
-                    // what newPos will be after we do an insertion:
-                    var addPathNewPos = addPath.oldPos - diagonalPath;
-                    canAdd = addPath && 0 <= addPathNewPos && addPathNewPos < newLen;
-                }
-                var canRemove = removePath && removePath.oldPos + 1 < oldLen;
-                if (!canAdd && !canRemove) {
-                    // If this path is a terminal then prune
-                    // @ts-expect-error - perf optimisation. This type-violating value will never be read.
-                    bestPath[diagonalPath] = undefined;
-                    continue;
-                }
-                // Select the diagonal that we want to branch from. We select the prior
-                // path whose position in the old string is the farthest from the origin
-                // and does not pass the bounds of the diff graph
-                if (!canRemove || (canAdd && removePath.oldPos < addPath.oldPos)) {
-                    basePath = _this.addToPath(addPath, true, false, 0, options);
-                }
-                else {
-                    basePath = _this.addToPath(removePath, false, true, 1, options);
-                }
-                newPos = _this.extractCommon(basePath, newTokens, oldTokens, diagonalPath, options);
-                if (basePath.oldPos + 1 >= oldLen && newPos + 1 >= newLen) {
-                    // If we have hit the end of both strings, then we are done
-                    return done(_this.buildValues(basePath.lastComponent, newTokens, oldTokens)) || true;
-                }
-                else {
-                    bestPath[diagonalPath] = basePath;
-                    if (basePath.oldPos + 1 >= oldLen) {
-                        maxDiagonalToConsider = Math.min(maxDiagonalToConsider, diagonalPath - 1);
-                    }
-                    if (newPos + 1 >= newLen) {
-                        minDiagonalToConsider = Math.max(minDiagonalToConsider, diagonalPath + 1);
-                    }
-                }
-            }
-            editLength++;
-        };
-        // Performs the length of edit iteration. Is a bit fugly as this has to support the
-        // sync and async mode which is never fun. Loops over execEditLength until a value
-        // is produced, or until the edit length exceeds options.maxEditLength (if given),
-        // in which case it will return undefined.
-        if (callback) {
-            (function exec() {
-                setTimeout(function () {
-                    if (editLength > maxEditLength || Date.now() > abortAfterTimestamp) {
-                        return callback(undefined);
-                    }
-                    if (!execEditLength()) {
-                        exec();
-                    }
-                }, 0);
-            }());
-        }
-        else {
-            while (editLength <= maxEditLength && Date.now() <= abortAfterTimestamp) {
-                var ret = execEditLength();
-                if (ret) {
-                    return ret;
-                }
-            }
-        }
-    };
-    Diff.prototype.addToPath = function (path, added, removed, oldPosInc, options) {
-        var last = path.lastComponent;
-        if (last && !options.oneChangePerToken && last.added === added && last.removed === removed) {
-            return {
-                oldPos: path.oldPos + oldPosInc,
-                lastComponent: { count: last.count + 1, added: added, removed: removed, previousComponent: last.previousComponent }
-            };
-        }
-        else {
-            return {
-                oldPos: path.oldPos + oldPosInc,
-                lastComponent: { count: 1, added: added, removed: removed, previousComponent: last }
-            };
-        }
-    };
-    Diff.prototype.extractCommon = function (basePath, newTokens, oldTokens, diagonalPath, options) {
-        var newLen = newTokens.length, oldLen = oldTokens.length;
-        var oldPos = basePath.oldPos, newPos = oldPos - diagonalPath, commonCount = 0;
-        while (newPos + 1 < newLen && oldPos + 1 < oldLen && this.equals(oldTokens[oldPos + 1], newTokens[newPos + 1], options)) {
-            newPos++;
-            oldPos++;
-            commonCount++;
-            if (options.oneChangePerToken) {
-                basePath.lastComponent = { count: 1, previousComponent: basePath.lastComponent, added: false, removed: false };
-            }
-        }
-        if (commonCount && !options.oneChangePerToken) {
-            basePath.lastComponent = { count: commonCount, previousComponent: basePath.lastComponent, added: false, removed: false };
-        }
-        basePath.oldPos = oldPos;
-        return newPos;
-    };
-    Diff.prototype.equals = function (left, right, options) {
-        if (options.comparator) {
-            return options.comparator(left, right);
-        }
-        else {
-            return left === right
-                || (!!options.ignoreCase && left.toLowerCase() === right.toLowerCase());
-        }
-    };
-    Diff.prototype.removeEmpty = function (array) {
-        var ret = [];
-        for (var i = 0; i < array.length; i++) {
-            if (array[i]) {
-                ret.push(array[i]);
-            }
-        }
-        return ret;
-    };
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    Diff.prototype.castInput = function (value, options) {
-        return value;
-    };
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    Diff.prototype.tokenize = function (value, options) {
-        return Array.from(value);
-    };
-    Diff.prototype.join = function (chars) {
-        // Assumes ValueT is string, which is the case for most subclasses.
-        // When it's false, e.g. in diffArrays, this method needs to be overridden (e.g. with a no-op)
-        // Yes, the casts are verbose and ugly, because this pattern - of having the base class SORT OF
-        // assume tokens and values are strings, but not completely - is weird and janky.
-        return chars.join('');
-    };
-    Diff.prototype.postProcess = function (changeObjects, 
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    options) {
-        return changeObjects;
-    };
-    Object.defineProperty(Diff.prototype, "useLongestToken", {
-        get: function () {
-            return false;
-        },
-        enumerable: false,
-        configurable: true
-    });
-    Diff.prototype.buildValues = function (lastComponent, newTokens, oldTokens) {
-        // First we convert our linked list of components in reverse order to an
-        // array in the right order:
-        var components = [];
-        var nextComponent;
-        while (lastComponent) {
-            components.push(lastComponent);
-            nextComponent = lastComponent.previousComponent;
-            delete lastComponent.previousComponent;
-            lastComponent = nextComponent;
-        }
-        components.reverse();
-        var componentLen = components.length;
-        var componentPos = 0, newPos = 0, oldPos = 0;
-        for (; componentPos < componentLen; componentPos++) {
-            var component = components[componentPos];
-            if (!component.removed) {
-                if (!component.added && this.useLongestToken) {
-                    var value = newTokens.slice(newPos, newPos + component.count);
-                    value = value.map(function (value, i) {
-                        var oldValue = oldTokens[oldPos + i];
-                        return oldValue.length > value.length ? oldValue : value;
-                    });
-                    component.value = this.join(value);
-                }
-                else {
-                    component.value = this.join(newTokens.slice(newPos, newPos + component.count));
-                }
-                newPos += component.count;
-                // Common case
-                if (!component.added) {
-                    oldPos += component.count;
-                }
-            }
-            else {
-                component.value = this.join(oldTokens.slice(oldPos, oldPos + component.count));
-                oldPos += component.count;
-            }
-        }
-        return components;
-    };
-    return Diff;
-}());
-exports["default"] = Diff;
-
-
-/***/ }),
-
-/***/ 45304:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = function (d, b) {
-        extendStatics = Object.setPrototypeOf ||
-            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
-        return extendStatics(d, b);
-    };
-    return function (d, b) {
-        if (typeof b !== "function" && b !== null)
-            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.characterDiff = void 0;
-exports.diffChars = diffChars;
-var base_js_1 = __nccwpck_require__(37922);
-var CharacterDiff = /** @class */ (function (_super) {
-    __extends(CharacterDiff, _super);
-    function CharacterDiff() {
-        return _super !== null && _super.apply(this, arguments) || this;
-    }
-    return CharacterDiff;
-}(base_js_1.default));
-exports.characterDiff = new CharacterDiff();
-function diffChars(oldStr, newStr, options) {
-    return exports.characterDiff.diff(oldStr, newStr, options);
-}
-
-
-/***/ }),
-
-/***/ 78512:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = function (d, b) {
-        extendStatics = Object.setPrototypeOf ||
-            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
-        return extendStatics(d, b);
-    };
-    return function (d, b) {
-        if (typeof b !== "function" && b !== null)
-            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.cssDiff = void 0;
-exports.diffCss = diffCss;
-var base_js_1 = __nccwpck_require__(37922);
-var CssDiff = /** @class */ (function (_super) {
-    __extends(CssDiff, _super);
-    function CssDiff() {
-        return _super !== null && _super.apply(this, arguments) || this;
-    }
-    CssDiff.prototype.tokenize = function (value) {
-        return value.split(/([{}:;,]|\s+)/);
-    };
-    return CssDiff;
-}(base_js_1.default));
-exports.cssDiff = new CssDiff();
-function diffCss(oldStr, newStr, options) {
-    return exports.cssDiff.diff(oldStr, newStr, options);
-}
-
-
-/***/ }),
-
-/***/ 72369:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = function (d, b) {
-        extendStatics = Object.setPrototypeOf ||
-            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
-        return extendStatics(d, b);
-    };
-    return function (d, b) {
-        if (typeof b !== "function" && b !== null)
-            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.jsonDiff = void 0;
-exports.diffJson = diffJson;
-exports.canonicalize = canonicalize;
-var base_js_1 = __nccwpck_require__(37922);
-var line_js_1 = __nccwpck_require__(65945);
-var JsonDiff = /** @class */ (function (_super) {
-    __extends(JsonDiff, _super);
-    function JsonDiff() {
-        var _this = _super !== null && _super.apply(this, arguments) || this;
-        _this.tokenize = line_js_1.tokenize;
-        return _this;
-    }
-    Object.defineProperty(JsonDiff.prototype, "useLongestToken", {
-        get: function () {
-            // Discriminate between two lines of pretty-printed, serialized JSON where one of them has a
-            // dangling comma and the other doesn't. Turns out including the dangling comma yields the nicest output:
-            return true;
-        },
-        enumerable: false,
-        configurable: true
-    });
-    JsonDiff.prototype.castInput = function (value, options) {
-        var undefinedReplacement = options.undefinedReplacement, _a = options.stringifyReplacer, stringifyReplacer = _a === void 0 ? function (k, v) { return typeof v === 'undefined' ? undefinedReplacement : v; } : _a;
-        return typeof value === 'string' ? value : JSON.stringify(canonicalize(value, null, null, stringifyReplacer), null, '  ');
-    };
-    JsonDiff.prototype.equals = function (left, right, options) {
-        return _super.prototype.equals.call(this, left.replace(/,([\r\n])/g, '$1'), right.replace(/,([\r\n])/g, '$1'), options);
-    };
-    return JsonDiff;
-}(base_js_1.default));
-exports.jsonDiff = new JsonDiff();
-function diffJson(oldStr, newStr, options) {
-    return exports.jsonDiff.diff(oldStr, newStr, options);
-}
-// This function handles the presence of circular references by bailing out when encountering an
-// object that is already on the "stack" of items being processed. Accepts an optional replacer
-function canonicalize(obj, stack, replacementStack, replacer, key) {
-    stack = stack || [];
-    replacementStack = replacementStack || [];
-    if (replacer) {
-        obj = replacer(key === undefined ? '' : key, obj);
-    }
-    var i;
-    for (i = 0; i < stack.length; i += 1) {
-        if (stack[i] === obj) {
-            return replacementStack[i];
-        }
-    }
-    var canonicalizedObj;
-    if ('[object Array]' === Object.prototype.toString.call(obj)) {
-        stack.push(obj);
-        canonicalizedObj = new Array(obj.length);
-        replacementStack.push(canonicalizedObj);
-        for (i = 0; i < obj.length; i += 1) {
-            canonicalizedObj[i] = canonicalize(obj[i], stack, replacementStack, replacer, String(i));
-        }
-        stack.pop();
-        replacementStack.pop();
-        return canonicalizedObj;
-    }
-    if (obj && obj.toJSON) {
-        obj = obj.toJSON();
-    }
-    if (typeof obj === 'object' && obj !== null) {
-        stack.push(obj);
-        canonicalizedObj = {};
-        replacementStack.push(canonicalizedObj);
-        var sortedKeys = [];
-        var key_1;
-        for (key_1 in obj) {
-            /* istanbul ignore else */
-            if (Object.prototype.hasOwnProperty.call(obj, key_1)) {
-                sortedKeys.push(key_1);
-            }
-        }
-        sortedKeys.sort();
-        for (i = 0; i < sortedKeys.length; i += 1) {
-            key_1 = sortedKeys[i];
-            canonicalizedObj[key_1] = canonicalize(obj[key_1], stack, replacementStack, replacer, key_1);
-        }
-        stack.pop();
-        replacementStack.pop();
-    }
-    else {
-        canonicalizedObj = obj;
-    }
-    return canonicalizedObj;
-}
-
-
-/***/ }),
-
-/***/ 65945:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = function (d, b) {
-        extendStatics = Object.setPrototypeOf ||
-            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
-        return extendStatics(d, b);
-    };
-    return function (d, b) {
-        if (typeof b !== "function" && b !== null)
-            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.lineDiff = void 0;
-exports.diffLines = diffLines;
-exports.diffTrimmedLines = diffTrimmedLines;
-exports.tokenize = tokenize;
-var base_js_1 = __nccwpck_require__(37922);
-var params_js_1 = __nccwpck_require__(62160);
-var LineDiff = /** @class */ (function (_super) {
-    __extends(LineDiff, _super);
-    function LineDiff() {
-        var _this = _super !== null && _super.apply(this, arguments) || this;
-        _this.tokenize = tokenize;
-        return _this;
-    }
-    LineDiff.prototype.equals = function (left, right, options) {
-        // If we're ignoring whitespace, we need to normalise lines by stripping
-        // whitespace before checking equality. (This has an annoying interaction
-        // with newlineIsToken that requires special handling: if newlines get their
-        // own token, then we DON'T want to trim the *newline* tokens down to empty
-        // strings, since this would cause us to treat whitespace-only line content
-        // as equal to a separator between lines, which would be weird and
-        // inconsistent with the documented behavior of the options.)
-        if (options.ignoreWhitespace) {
-            if (!options.newlineIsToken || !left.includes('\n')) {
-                left = left.trim();
-            }
-            if (!options.newlineIsToken || !right.includes('\n')) {
-                right = right.trim();
-            }
-        }
-        else if (options.ignoreNewlineAtEof && !options.newlineIsToken) {
-            if (left.endsWith('\n')) {
-                left = left.slice(0, -1);
-            }
-            if (right.endsWith('\n')) {
-                right = right.slice(0, -1);
-            }
-        }
-        return _super.prototype.equals.call(this, left, right, options);
-    };
-    return LineDiff;
-}(base_js_1.default));
-exports.lineDiff = new LineDiff();
-function diffLines(oldStr, newStr, options) {
-    return exports.lineDiff.diff(oldStr, newStr, options);
-}
-function diffTrimmedLines(oldStr, newStr, options) {
-    options = (0, params_js_1.generateOptions)(options, { ignoreWhitespace: true });
-    return exports.lineDiff.diff(oldStr, newStr, options);
-}
-// Exported standalone so it can be used from jsonDiff too.
-function tokenize(value, options) {
-    if (options.stripTrailingCr) {
-        // remove one \r before \n to match GNU diff's --strip-trailing-cr behavior
-        value = value.replace(/\r\n/g, '\n');
-    }
-    var retLines = [], linesAndNewlines = value.split(/(\n|\r\n)/);
-    // Ignore the final empty token that occurs if the string ends with a new line
-    if (!linesAndNewlines[linesAndNewlines.length - 1]) {
-        linesAndNewlines.pop();
-    }
-    // Merge the content and line separators into single tokens
-    for (var i = 0; i < linesAndNewlines.length; i++) {
-        var line = linesAndNewlines[i];
-        if (i % 2 && !options.newlineIsToken) {
-            retLines[retLines.length - 1] += line;
-        }
-        else {
-            retLines.push(line);
-        }
-    }
-    return retLines;
-}
-
-
-/***/ }),
-
-/***/ 66538:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = function (d, b) {
-        extendStatics = Object.setPrototypeOf ||
-            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
-        return extendStatics(d, b);
-    };
-    return function (d, b) {
-        if (typeof b !== "function" && b !== null)
-            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.sentenceDiff = void 0;
-exports.diffSentences = diffSentences;
-var base_js_1 = __nccwpck_require__(37922);
-function isSentenceEndPunct(char) {
-    return char == '.' || char == '!' || char == '?';
-}
-var SentenceDiff = /** @class */ (function (_super) {
-    __extends(SentenceDiff, _super);
-    function SentenceDiff() {
-        return _super !== null && _super.apply(this, arguments) || this;
-    }
-    SentenceDiff.prototype.tokenize = function (value) {
-        var _a;
-        // If in future we drop support for environments that don't support lookbehinds, we can replace
-        // this entire function with:
-        //     return value.split(/(?<=[.!?])(\s+|$)/);
-        // but until then, for similar reasons to the trailingWs function in string.ts, we are forced
-        // to do this verbosely "by hand" instead of using a regex.
-        var result = [];
-        var tokenStartI = 0;
-        for (var i = 0; i < value.length; i++) {
-            if (i == value.length - 1) {
-                result.push(value.slice(tokenStartI));
-                break;
-            }
-            if (isSentenceEndPunct(value[i]) && value[i + 1].match(/\s/)) {
-                // We've hit a sentence break - i.e. a punctuation mark followed by whitespace.
-                // We now want to push TWO tokens to the result:
-                // 1. the sentence
-                result.push(value.slice(tokenStartI, i + 1));
-                // 2. the whitespace
-                i = tokenStartI = i + 1;
-                while ((_a = value[i + 1]) === null || _a === void 0 ? void 0 : _a.match(/\s/)) {
-                    i++;
-                }
-                result.push(value.slice(tokenStartI, i + 1));
-                // Then the next token (a sentence) starts on the character after the whitespace.
-                // (It's okay if this is off the end of the string - then the outer loop will terminate
-                // here anyway.)
-                tokenStartI = i + 1;
-            }
-        }
-        return result;
-    };
-    return SentenceDiff;
-}(base_js_1.default));
-exports.sentenceDiff = new SentenceDiff();
-function diffSentences(oldStr, newStr, options) {
-    return exports.sentenceDiff.diff(oldStr, newStr, options);
-}
-
-
-/***/ }),
-
-/***/ 62683:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = function (d, b) {
-        extendStatics = Object.setPrototypeOf ||
-            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
-        return extendStatics(d, b);
-    };
-    return function (d, b) {
-        if (typeof b !== "function" && b !== null)
-            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.wordsWithSpaceDiff = exports.wordDiff = void 0;
-exports.diffWords = diffWords;
-exports.diffWordsWithSpace = diffWordsWithSpace;
-var base_js_1 = __nccwpck_require__(37922);
-var string_js_1 = __nccwpck_require__(22943);
-// Based on https://en.wikipedia.org/wiki/Latin_script_in_Unicode
-//
-// Chars/ranges counted as "word" characters by this regex are as follows:
-//
-// + U+00AD  Soft hyphen
-// + 00C0–00FF (letters with diacritics from the Latin-1 Supplement), except:
-//   - U+00D7  × Multiplication sign
-//   - U+00F7  ÷ Division sign
-// + Latin Extended-A, 0100–017F
-// + Latin Extended-B, 0180–024F
-// + IPA Extensions, 0250–02AF
-// + Spacing Modifier Letters, 02B0–02FF, except:
-//   - U+02C7  ˇ &#711;  Caron
-//   - U+02D8  ˘ &#728;  Breve
-//   - U+02D9  ˙ &#729;  Dot Above
-//   - U+02DA  ˚ &#730;  Ring Above
-//   - U+02DB  ˛ &#731;  Ogonek
-//   - U+02DC  ˜ &#732;  Small Tilde
-//   - U+02DD  ˝ &#733;  Double Acute Accent
-// + Latin Extended Additional, 1E00–1EFF
-var extendedWordChars = 'a-zA-Z0-9_\\u{AD}\\u{C0}-\\u{D6}\\u{D8}-\\u{F6}\\u{F8}-\\u{2C6}\\u{2C8}-\\u{2D7}\\u{2DE}-\\u{2FF}\\u{1E00}-\\u{1EFF}';
-// Each token is one of the following:
-// - A punctuation mark plus the surrounding whitespace
-// - A word plus the surrounding whitespace
-// - Pure whitespace (but only in the special case where the entire text
-//   is just whitespace)
-//
-// We have to include surrounding whitespace in the tokens because the two
-// alternative approaches produce horribly broken results:
-// * If we just discard the whitespace, we can't fully reproduce the original
-//   text from the sequence of tokens and any attempt to render the diff will
-//   get the whitespace wrong.
-// * If we have separate tokens for whitespace, then in a typical text every
-//   second token will be a single space character. But this often results in
-//   the optimal diff between two texts being a perverse one that preserves
-//   the spaces between words but deletes and reinserts actual common words.
-//   See https://github.com/kpdecker/jsdiff/issues/160#issuecomment-1866099640
-//   for an example.
-//
-// Keeping the surrounding whitespace of course has implications for .equals
-// and .join, not just .tokenize.
-// This regex does NOT fully implement the tokenization rules described above.
-// Instead, it gives runs of whitespace their own "token". The tokenize method
-// then handles stitching whitespace tokens onto adjacent word or punctuation
-// tokens.
-var tokenizeIncludingWhitespace = new RegExp("[".concat(extendedWordChars, "]+|\\s+|[^").concat(extendedWordChars, "]"), 'ug');
-var WordDiff = /** @class */ (function (_super) {
-    __extends(WordDiff, _super);
-    function WordDiff() {
-        return _super !== null && _super.apply(this, arguments) || this;
-    }
-    WordDiff.prototype.equals = function (left, right, options) {
-        if (options.ignoreCase) {
-            left = left.toLowerCase();
-            right = right.toLowerCase();
-        }
-        return left.trim() === right.trim();
-    };
-    WordDiff.prototype.tokenize = function (value, options) {
-        if (options === void 0) { options = {}; }
-        var parts;
-        if (options.intlSegmenter) {
-            var segmenter = options.intlSegmenter;
-            if (segmenter.resolvedOptions().granularity != 'word') {
-                throw new Error('The segmenter passed must have a granularity of "word"');
-            }
-            // We want `parts` to be an array whose elements alternate between being
-            // pure whitespace and being pure non-whitespace. This is ALMOST what the
-            // segments returned by a word-based Intl.Segmenter already look like,
-            // but not quite - see explanation in the docs of our custom segment()
-            // function.
-            parts = (0, string_js_1.segment)(value, segmenter);
-        }
-        else {
-            parts = value.match(tokenizeIncludingWhitespace) || [];
-        }
-        var tokens = [];
-        var prevPart = null;
-        parts.forEach(function (part) {
-            if ((/\s/).test(part)) {
-                if (prevPart == null) {
-                    tokens.push(part);
-                }
-                else {
-                    tokens.push(tokens.pop() + part);
-                }
-            }
-            else if (prevPart != null && (/\s/).test(prevPart)) {
-                if (tokens[tokens.length - 1] == prevPart) {
-                    tokens.push(tokens.pop() + part);
-                }
-                else {
-                    tokens.push(prevPart + part);
-                }
-            }
-            else {
-                tokens.push(part);
-            }
-            prevPart = part;
-        });
-        return tokens;
-    };
-    WordDiff.prototype.join = function (tokens) {
-        // Tokens being joined here will always have appeared consecutively in the
-        // same text, so we can simply strip off the leading whitespace from all the
-        // tokens except the first (and except any whitespace-only tokens - but such
-        // a token will always be the first and only token anyway) and then join them
-        // and the whitespace around words and punctuation will end up correct.
-        return tokens.map(function (token, i) {
-            if (i == 0) {
-                return token;
-            }
-            else {
-                return token.replace((/^\s+/), '');
-            }
-        }).join('');
-    };
-    WordDiff.prototype.postProcess = function (changes, options) {
-        if (!changes || options.oneChangePerToken) {
-            return changes;
-        }
-        var lastKeep = null;
-        // Change objects representing any insertion or deletion since the last
-        // "keep" change object. There can be at most one of each.
-        var insertion = null;
-        var deletion = null;
-        changes.forEach(function (change) {
-            if (change.added) {
-                insertion = change;
-            }
-            else if (change.removed) {
-                deletion = change;
-            }
-            else {
-                if (insertion || deletion) { // May be false at start of text
-                    dedupeWhitespaceInChangeObjects(lastKeep, deletion, insertion, change, options.intlSegmenter);
-                }
-                lastKeep = change;
-                insertion = null;
-                deletion = null;
-            }
-        });
-        if (insertion || deletion) {
-            dedupeWhitespaceInChangeObjects(lastKeep, deletion, insertion, null, options.intlSegmenter);
-        }
-        return changes;
-    };
-    return WordDiff;
-}(base_js_1.default));
-exports.wordDiff = new WordDiff();
-function diffWords(oldStr, newStr, options) {
-    // This option has never been documented and never will be (it's clearer to
-    // just call `diffWordsWithSpace` directly if you need that behavior), but
-    // has existed in jsdiff for a long time, so we retain support for it here
-    // for the sake of backwards compatibility.
-    if ((options === null || options === void 0 ? void 0 : options.ignoreWhitespace) != null && !options.ignoreWhitespace) {
-        return diffWordsWithSpace(oldStr, newStr, options);
-    }
-    return exports.wordDiff.diff(oldStr, newStr, options);
-}
-function dedupeWhitespaceInChangeObjects(startKeep, deletion, insertion, endKeep, segmenter) {
-    // Before returning, we tidy up the leading and trailing whitespace of the
-    // change objects to eliminate cases where trailing whitespace in one object
-    // is repeated as leading whitespace in the next.
-    // Below are examples of the outcomes we want here to explain the code.
-    // I=insert, K=keep, D=delete
-    // 1. diffing 'foo bar baz' vs 'foo baz'
-    //    Prior to cleanup, we have K:'foo ' D:' bar ' K:' baz'
-    //    After cleanup, we want:   K:'foo ' D:'bar ' K:'baz'
-    //
-    // 2. Diffing 'foo bar baz' vs 'foo qux baz'
-    //    Prior to cleanup, we have K:'foo ' D:' bar ' I:' qux ' K:' baz'
-    //    After cleanup, we want K:'foo ' D:'bar' I:'qux' K:' baz'
-    //
-    // 3. Diffing 'foo\nbar baz' vs 'foo baz'
-    //    Prior to cleanup, we have K:'foo ' D:'\nbar ' K:' baz'
-    //    After cleanup, we want K'foo' D:'\nbar' K:' baz'
-    //
-    // 4. Diffing 'foo baz' vs 'foo\nbar baz'
-    //    Prior to cleanup, we have K:'foo\n' I:'\nbar ' K:' baz'
-    //    After cleanup, we ideally want K'foo' I:'\nbar' K:' baz'
-    //    but don't actually manage this currently (the pre-cleanup change
-    //    objects don't contain enough information to make it possible).
-    //
-    // 5. Diffing 'foo   bar baz' vs 'foo  baz'
-    //    Prior to cleanup, we have K:'foo  ' D:'   bar ' K:'  baz'
-    //    After cleanup, we want K:'foo  ' D:' bar ' K:'baz'
-    //
-    // Our handling is unavoidably imperfect in the case where there's a single
-    // indel between keeps and the whitespace has changed. For instance, consider
-    // diffing 'foo\tbar\nbaz' vs 'foo baz'. Unless we create an extra change
-    // object to represent the insertion of the space character (which isn't even
-    // a token), we have no way to avoid losing information about the texts'
-    // original whitespace in the result we return. Still, we do our best to
-    // output something that will look sensible if we e.g. print it with
-    // insertions in green and deletions in red.
-    // Between two "keep" change objects (or before the first or after the last
-    // change object), we can have either:
-    // * A "delete" followed by an "insert"
-    // * Just an "insert"
-    // * Just a "delete"
-    // We handle the three cases separately.
-    if (deletion && insertion) {
-        var _a = (0, string_js_1.leadingAndTrailingWs)(deletion.value, segmenter), oldWsPrefix = _a[0], oldWsSuffix = _a[1];
-        var _b = (0, string_js_1.leadingAndTrailingWs)(insertion.value, segmenter), newWsPrefix = _b[0], newWsSuffix = _b[1];
-        if (startKeep) {
-            var commonWsPrefix = (0, string_js_1.longestCommonPrefix)(oldWsPrefix, newWsPrefix);
-            startKeep.value = (0, string_js_1.replaceSuffix)(startKeep.value, newWsPrefix, commonWsPrefix);
-            deletion.value = (0, string_js_1.removePrefix)(deletion.value, commonWsPrefix);
-            insertion.value = (0, string_js_1.removePrefix)(insertion.value, commonWsPrefix);
-        }
-        if (endKeep) {
-            var commonWsSuffix = (0, string_js_1.longestCommonSuffix)(oldWsSuffix, newWsSuffix);
-            endKeep.value = (0, string_js_1.replacePrefix)(endKeep.value, newWsSuffix, commonWsSuffix);
-            deletion.value = (0, string_js_1.removeSuffix)(deletion.value, commonWsSuffix);
-            insertion.value = (0, string_js_1.removeSuffix)(insertion.value, commonWsSuffix);
-        }
-    }
-    else if (insertion) {
-        // The whitespaces all reflect what was in the new text rather than
-        // the old, so we essentially have no information about whitespace
-        // insertion or deletion. We just want to dedupe the whitespace.
-        // We do that by having each change object keep its trailing
-        // whitespace and deleting duplicate leading whitespace where
-        // present.
-        if (startKeep) {
-            var ws = (0, string_js_1.leadingWs)(insertion.value, segmenter);
-            insertion.value = insertion.value.substring(ws.length);
-        }
-        if (endKeep) {
-            var ws = (0, string_js_1.leadingWs)(endKeep.value, segmenter);
-            endKeep.value = endKeep.value.substring(ws.length);
-        }
-        // otherwise we've got a deletion and no insertion
-    }
-    else if (startKeep && endKeep) {
-        var newWsFull = (0, string_js_1.leadingWs)(endKeep.value, segmenter), _c = (0, string_js_1.leadingAndTrailingWs)(deletion.value, segmenter), delWsStart = _c[0], delWsEnd = _c[1];
-        // Any whitespace that comes straight after startKeep in both the old and
-        // new texts, assign to startKeep and remove from the deletion.
-        var newWsStart = (0, string_js_1.longestCommonPrefix)(newWsFull, delWsStart);
-        deletion.value = (0, string_js_1.removePrefix)(deletion.value, newWsStart);
-        // Any whitespace that comes straight before endKeep in both the old and
-        // new texts, and hasn't already been assigned to startKeep, assign to
-        // endKeep and remove from the deletion.
-        var newWsEnd = (0, string_js_1.longestCommonSuffix)((0, string_js_1.removePrefix)(newWsFull, newWsStart), delWsEnd);
-        deletion.value = (0, string_js_1.removeSuffix)(deletion.value, newWsEnd);
-        endKeep.value = (0, string_js_1.replacePrefix)(endKeep.value, newWsFull, newWsEnd);
-        // If there's any whitespace from the new text that HASN'T already been
-        // assigned, assign it to the start:
-        startKeep.value = (0, string_js_1.replaceSuffix)(startKeep.value, newWsFull, newWsFull.slice(0, newWsFull.length - newWsEnd.length));
-    }
-    else if (endKeep) {
-        // We are at the start of the text. Preserve all the whitespace on
-        // endKeep, and just remove whitespace from the end of deletion to the
-        // extent that it overlaps with the start of endKeep.
-        var endKeepWsPrefix = (0, string_js_1.leadingWs)(endKeep.value, segmenter);
-        var deletionWsSuffix = (0, string_js_1.trailingWs)(deletion.value, segmenter);
-        var overlap = (0, string_js_1.maximumOverlap)(deletionWsSuffix, endKeepWsPrefix);
-        deletion.value = (0, string_js_1.removeSuffix)(deletion.value, overlap);
-    }
-    else if (startKeep) {
-        // We are at the END of the text. Preserve all the whitespace on
-        // startKeep, and just remove whitespace from the start of deletion to
-        // the extent that it overlaps with the end of startKeep.
-        var startKeepWsSuffix = (0, string_js_1.trailingWs)(startKeep.value, segmenter);
-        var deletionWsPrefix = (0, string_js_1.leadingWs)(deletion.value, segmenter);
-        var overlap = (0, string_js_1.maximumOverlap)(startKeepWsSuffix, deletionWsPrefix);
-        deletion.value = (0, string_js_1.removePrefix)(deletion.value, overlap);
-    }
-}
-var WordsWithSpaceDiff = /** @class */ (function (_super) {
-    __extends(WordsWithSpaceDiff, _super);
-    function WordsWithSpaceDiff() {
-        return _super !== null && _super.apply(this, arguments) || this;
-    }
-    WordsWithSpaceDiff.prototype.tokenize = function (value) {
-        // Slightly different to the tokenizeIncludingWhitespace regex used above in
-        // that this one treats each individual newline as a distinct token, rather
-        // than merging them into other surrounding whitespace. This was requested
-        // in https://github.com/kpdecker/jsdiff/issues/180 &
-        //    https://github.com/kpdecker/jsdiff/issues/211
-        var regex = new RegExp("(\\r?\\n)|[".concat(extendedWordChars, "]+|[^\\S\\n\\r]+|[^").concat(extendedWordChars, "]"), 'ug');
-        return value.match(regex) || [];
-    };
-    return WordsWithSpaceDiff;
-}(base_js_1.default));
-exports.wordsWithSpaceDiff = new WordsWithSpaceDiff();
-function diffWordsWithSpace(oldStr, newStr, options) {
-    return exports.wordsWithSpaceDiff.diff(oldStr, newStr, options);
-}
-
-
-/***/ }),
-
-/***/ 69463:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-/* See LICENSE file for terms of use */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.canonicalize = exports.convertChangesToXML = exports.convertChangesToDMP = exports.reversePatch = exports.parsePatch = exports.applyPatches = exports.applyPatch = exports.OMIT_HEADERS = exports.FILE_HEADERS_ONLY = exports.INCLUDE_HEADERS = exports.formatPatch = exports.createPatch = exports.createTwoFilesPatch = exports.structuredPatch = exports.arrayDiff = exports.diffArrays = exports.jsonDiff = exports.diffJson = exports.cssDiff = exports.diffCss = exports.sentenceDiff = exports.diffSentences = exports.diffTrimmedLines = exports.lineDiff = exports.diffLines = exports.wordsWithSpaceDiff = exports.diffWordsWithSpace = exports.wordDiff = exports.diffWords = exports.characterDiff = exports.diffChars = exports.Diff = void 0;
-/*
- * Text diff implementation.
- *
- * This library supports the following APIs:
- * Diff.diffChars: Character by character diff
- * Diff.diffWords: Word (as defined by \b regex) diff which ignores whitespace
- * Diff.diffLines: Line based diff
- *
- * Diff.diffCss: Diff targeted at CSS content
- *
- * These methods are based on the implementation proposed in
- * "An O(ND) Difference Algorithm and its Variations" (Myers, 1986).
- * http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.4.6927
- */
-var base_js_1 = __nccwpck_require__(37922);
-exports.Diff = base_js_1.default;
-var character_js_1 = __nccwpck_require__(45304);
-Object.defineProperty(exports, "diffChars", ({ enumerable: true, get: function () { return character_js_1.diffChars; } }));
-Object.defineProperty(exports, "characterDiff", ({ enumerable: true, get: function () { return character_js_1.characterDiff; } }));
-var word_js_1 = __nccwpck_require__(62683);
-Object.defineProperty(exports, "diffWords", ({ enumerable: true, get: function () { return word_js_1.diffWords; } }));
-Object.defineProperty(exports, "diffWordsWithSpace", ({ enumerable: true, get: function () { return word_js_1.diffWordsWithSpace; } }));
-Object.defineProperty(exports, "wordDiff", ({ enumerable: true, get: function () { return word_js_1.wordDiff; } }));
-Object.defineProperty(exports, "wordsWithSpaceDiff", ({ enumerable: true, get: function () { return word_js_1.wordsWithSpaceDiff; } }));
-var line_js_1 = __nccwpck_require__(65945);
-Object.defineProperty(exports, "diffLines", ({ enumerable: true, get: function () { return line_js_1.diffLines; } }));
-Object.defineProperty(exports, "diffTrimmedLines", ({ enumerable: true, get: function () { return line_js_1.diffTrimmedLines; } }));
-Object.defineProperty(exports, "lineDiff", ({ enumerable: true, get: function () { return line_js_1.lineDiff; } }));
-var sentence_js_1 = __nccwpck_require__(66538);
-Object.defineProperty(exports, "diffSentences", ({ enumerable: true, get: function () { return sentence_js_1.diffSentences; } }));
-Object.defineProperty(exports, "sentenceDiff", ({ enumerable: true, get: function () { return sentence_js_1.sentenceDiff; } }));
-var css_js_1 = __nccwpck_require__(78512);
-Object.defineProperty(exports, "diffCss", ({ enumerable: true, get: function () { return css_js_1.diffCss; } }));
-Object.defineProperty(exports, "cssDiff", ({ enumerable: true, get: function () { return css_js_1.cssDiff; } }));
-var json_js_1 = __nccwpck_require__(72369);
-Object.defineProperty(exports, "diffJson", ({ enumerable: true, get: function () { return json_js_1.diffJson; } }));
-Object.defineProperty(exports, "canonicalize", ({ enumerable: true, get: function () { return json_js_1.canonicalize; } }));
-Object.defineProperty(exports, "jsonDiff", ({ enumerable: true, get: function () { return json_js_1.jsonDiff; } }));
-var array_js_1 = __nccwpck_require__(51898);
-Object.defineProperty(exports, "diffArrays", ({ enumerable: true, get: function () { return array_js_1.diffArrays; } }));
-Object.defineProperty(exports, "arrayDiff", ({ enumerable: true, get: function () { return array_js_1.arrayDiff; } }));
-var apply_js_1 = __nccwpck_require__(26170);
-Object.defineProperty(exports, "applyPatch", ({ enumerable: true, get: function () { return apply_js_1.applyPatch; } }));
-Object.defineProperty(exports, "applyPatches", ({ enumerable: true, get: function () { return apply_js_1.applyPatches; } }));
-var parse_js_1 = __nccwpck_require__(51109);
-Object.defineProperty(exports, "parsePatch", ({ enumerable: true, get: function () { return parse_js_1.parsePatch; } }));
-var reverse_js_1 = __nccwpck_require__(74984);
-Object.defineProperty(exports, "reversePatch", ({ enumerable: true, get: function () { return reverse_js_1.reversePatch; } }));
-var create_js_1 = __nccwpck_require__(96284);
-Object.defineProperty(exports, "structuredPatch", ({ enumerable: true, get: function () { return create_js_1.structuredPatch; } }));
-Object.defineProperty(exports, "createTwoFilesPatch", ({ enumerable: true, get: function () { return create_js_1.createTwoFilesPatch; } }));
-Object.defineProperty(exports, "createPatch", ({ enumerable: true, get: function () { return create_js_1.createPatch; } }));
-Object.defineProperty(exports, "formatPatch", ({ enumerable: true, get: function () { return create_js_1.formatPatch; } }));
-Object.defineProperty(exports, "INCLUDE_HEADERS", ({ enumerable: true, get: function () { return create_js_1.INCLUDE_HEADERS; } }));
-Object.defineProperty(exports, "FILE_HEADERS_ONLY", ({ enumerable: true, get: function () { return create_js_1.FILE_HEADERS_ONLY; } }));
-Object.defineProperty(exports, "OMIT_HEADERS", ({ enumerable: true, get: function () { return create_js_1.OMIT_HEADERS; } }));
-var dmp_js_1 = __nccwpck_require__(13878);
-Object.defineProperty(exports, "convertChangesToDMP", ({ enumerable: true, get: function () { return dmp_js_1.convertChangesToDMP; } }));
-var xml_js_1 = __nccwpck_require__(85222);
-Object.defineProperty(exports, "convertChangesToXML", ({ enumerable: true, get: function () { return xml_js_1.convertChangesToXML; } }));
-
-
-/***/ }),
-
-/***/ 26170:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.applyPatch = applyPatch;
-exports.applyPatches = applyPatches;
-var string_js_1 = __nccwpck_require__(22943);
-var line_endings_js_1 = __nccwpck_require__(72591);
-var parse_js_1 = __nccwpck_require__(51109);
-var distance_iterator_js_1 = __nccwpck_require__(72724);
-/**
- * attempts to apply a unified diff patch.
- *
- * Hunks are applied first to last.
- * `applyPatch` first tries to apply the first hunk at the line number specified in the hunk header, and with all context lines matching exactly.
- * If that fails, it tries scanning backwards and forwards, one line at a time, to find a place to apply the hunk where the context lines match exactly.
- * If that still fails, and `fuzzFactor` is greater than zero, it increments the maximum number of mismatches (missing, extra, or changed context lines) that there can be between the hunk context and a region where we are trying to apply the patch such that the hunk will still be considered to match.
- * Regardless of `fuzzFactor`, lines to be deleted in the hunk *must* be present for a hunk to match, and the context lines *immediately* before and after an insertion must match exactly.
- *
- * Once a hunk is successfully fitted, the process begins again with the next hunk.
- * Regardless of `fuzzFactor`, later hunks must be applied later in the file than earlier hunks.
- *
- * If a hunk cannot be successfully fitted *anywhere* with fewer than `fuzzFactor` mismatches, `applyPatch` fails and returns `false`.
- *
- * If a hunk is successfully fitted but not at the line number specified by the hunk header, all subsequent hunks have their target line number adjusted accordingly.
- * (e.g. if the first hunk is applied 10 lines below where the hunk header said it should fit, `applyPatch` will *start* looking for somewhere to apply the second hunk 10 lines below where its hunk header says it goes.)
- *
- * If the patch was applied successfully, returns a string containing the patched text.
- * If the patch could not be applied (because some hunks in the patch couldn't be fitted to the text in `source`), `applyPatch` returns false.
- *
- * @param patch a string diff or the output from the `parsePatch` or `structuredPatch` methods.
- */
-function applyPatch(source, patch, options) {
-    if (options === void 0) { options = {}; }
-    var patches;
-    if (typeof patch === 'string') {
-        patches = (0, parse_js_1.parsePatch)(patch);
-    }
-    else if (Array.isArray(patch)) {
-        patches = patch;
-    }
-    else {
-        patches = [patch];
-    }
-    if (patches.length > 1) {
-        throw new Error('applyPatch only works with a single input.');
-    }
-    return applyStructuredPatch(source, patches[0], options);
-}
-function applyStructuredPatch(source, patch, options) {
-    if (options === void 0) { options = {}; }
-    if (options.autoConvertLineEndings || options.autoConvertLineEndings == null) {
-        if ((0, string_js_1.hasOnlyWinLineEndings)(source) && (0, line_endings_js_1.isUnix)(patch)) {
-            patch = (0, line_endings_js_1.unixToWin)(patch);
-        }
-        else if ((0, string_js_1.hasOnlyUnixLineEndings)(source) && (0, line_endings_js_1.isWin)(patch)) {
-            patch = (0, line_endings_js_1.winToUnix)(patch);
-        }
-    }
-    // Apply the diff to the input
-    var lines = source.split('\n'), hunks = patch.hunks, compareLine = options.compareLine || (function (lineNumber, line, operation, patchContent) { return line === patchContent; }), fuzzFactor = options.fuzzFactor || 0;
-    var minLine = 0;
-    if (fuzzFactor < 0 || !Number.isInteger(fuzzFactor)) {
-        throw new Error('fuzzFactor must be a non-negative integer');
-    }
-    // Special case for empty patch.
-    if (!hunks.length) {
-        return source;
-    }
-    // Before anything else, handle EOFNL insertion/removal. If the patch tells us to make a change
-    // to the EOFNL that is redundant/impossible - i.e. to remove a newline that's not there, or add a
-    // newline that already exists - then we either return false and fail to apply the patch (if
-    // fuzzFactor is 0) or simply ignore the problem and do nothing (if fuzzFactor is >0).
-    // If we do need to remove/add a newline at EOF, this will always be in the final hunk:
-    var prevLine = '', removeEOFNL = false, addEOFNL = false;
-    for (var i = 0; i < hunks[hunks.length - 1].lines.length; i++) {
-        var line = hunks[hunks.length - 1].lines[i];
-        if (line[0] == '\\') {
-            if (prevLine[0] == '+') {
-                removeEOFNL = true;
-            }
-            else if (prevLine[0] == '-') {
-                addEOFNL = true;
-            }
-        }
-        prevLine = line;
-    }
-    if (removeEOFNL) {
-        if (addEOFNL) {
-            // This means the final line gets changed but doesn't have a trailing newline in either the
-            // original or patched version. In that case, we do nothing if fuzzFactor > 0, and if
-            // fuzzFactor is 0, we simply validate that the source file has no trailing newline.
-            if (!fuzzFactor && lines[lines.length - 1] == '') {
-                return false;
-            }
-        }
-        else if (lines[lines.length - 1] == '') {
-            lines.pop();
-        }
-        else if (!fuzzFactor) {
-            return false;
-        }
-    }
-    else if (addEOFNL) {
-        if (lines[lines.length - 1] != '') {
-            lines.push('');
-        }
-        else if (!fuzzFactor) {
-            return false;
-        }
-    }
-    /**
-     * Checks if the hunk can be made to fit at the provided location with at most `maxErrors`
-     * insertions, substitutions, or deletions, while ensuring also that:
-     * - lines deleted in the hunk match exactly, and
-     * - wherever an insertion operation or block of insertion operations appears in the hunk, the
-     *   immediately preceding and following lines of context match exactly
-     *
-     * `toPos` should be set such that lines[toPos] is meant to match hunkLines[0].
-     *
-     * If the hunk can be applied, returns an object with properties `oldLineLastI` and
-     * `replacementLines`. Otherwise, returns null.
-     */
-    function applyHunk(hunkLines, toPos, maxErrors, hunkLinesI, lastContextLineMatched, patchedLines, patchedLinesLength) {
-        if (hunkLinesI === void 0) { hunkLinesI = 0; }
-        if (lastContextLineMatched === void 0) { lastContextLineMatched = true; }
-        if (patchedLines === void 0) { patchedLines = []; }
-        if (patchedLinesLength === void 0) { patchedLinesLength = 0; }
-        var nConsecutiveOldContextLines = 0;
-        var nextContextLineMustMatch = false;
-        for (; hunkLinesI < hunkLines.length; hunkLinesI++) {
-            var hunkLine = hunkLines[hunkLinesI], operation = (hunkLine.length > 0 ? hunkLine[0] : ' '), content = (hunkLine.length > 0 ? hunkLine.substr(1) : hunkLine);
-            if (operation === '-') {
-                if (compareLine(toPos + 1, lines[toPos], operation, content)) {
-                    toPos++;
-                    nConsecutiveOldContextLines = 0;
-                }
-                else {
-                    if (!maxErrors || lines[toPos] == null) {
-                        return null;
-                    }
-                    patchedLines[patchedLinesLength] = lines[toPos];
-                    return applyHunk(hunkLines, toPos + 1, maxErrors - 1, hunkLinesI, false, patchedLines, patchedLinesLength + 1);
-                }
-            }
-            if (operation === '+') {
-                if (!lastContextLineMatched) {
-                    return null;
-                }
-                patchedLines[patchedLinesLength] = content;
-                patchedLinesLength++;
-                nConsecutiveOldContextLines = 0;
-                nextContextLineMustMatch = true;
-            }
-            if (operation === ' ') {
-                nConsecutiveOldContextLines++;
-                patchedLines[patchedLinesLength] = lines[toPos];
-                if (compareLine(toPos + 1, lines[toPos], operation, content)) {
-                    patchedLinesLength++;
-                    lastContextLineMatched = true;
-                    nextContextLineMustMatch = false;
-                    toPos++;
-                }
-                else {
-                    if (nextContextLineMustMatch || !maxErrors) {
-                        return null;
-                    }
-                    // Consider 3 possibilities in sequence:
-                    // 1. lines contains a *substitution* not included in the patch context, or
-                    // 2. lines contains an *insertion* not included in the patch context, or
-                    // 3. lines contains a *deletion* not included in the patch context
-                    // The first two options are of course only possible if the line from lines is non-null -
-                    // i.e. only option 3 is possible if we've overrun the end of the old file.
-                    return (lines[toPos] && (applyHunk(hunkLines, toPos + 1, maxErrors - 1, hunkLinesI + 1, false, patchedLines, patchedLinesLength + 1) || applyHunk(hunkLines, toPos + 1, maxErrors - 1, hunkLinesI, false, patchedLines, patchedLinesLength + 1)) || applyHunk(hunkLines, toPos, maxErrors - 1, hunkLinesI + 1, false, patchedLines, patchedLinesLength));
-                }
-            }
-        }
-        // Before returning, trim any unmodified context lines off the end of patchedLines and reduce
-        // toPos (and thus oldLineLastI) accordingly. This allows later hunks to be applied to a region
-        // that starts in this hunk's trailing context.
-        patchedLinesLength -= nConsecutiveOldContextLines;
-        toPos -= nConsecutiveOldContextLines;
-        patchedLines.length = patchedLinesLength;
-        return {
-            patchedLines: patchedLines,
-            oldLineLastI: toPos - 1
-        };
-    }
-    var resultLines = [];
-    // Search best fit offsets for each hunk based on the previous ones
-    var prevHunkOffset = 0;
-    for (var i = 0; i < hunks.length; i++) {
-        var hunk = hunks[i];
-        var hunkResult = void 0;
-        var maxLine = lines.length - hunk.oldLines + fuzzFactor;
-        var toPos = void 0;
-        for (var maxErrors = 0; maxErrors <= fuzzFactor; maxErrors++) {
-            toPos = hunk.oldStart + prevHunkOffset - 1;
-            var iterator = (0, distance_iterator_js_1.default)(toPos, minLine, maxLine);
-            for (; toPos !== undefined; toPos = iterator()) {
-                hunkResult = applyHunk(hunk.lines, toPos, maxErrors);
-                if (hunkResult) {
-                    break;
-                }
-            }
-            if (hunkResult) {
-                break;
-            }
-        }
-        if (!hunkResult) {
-            return false;
-        }
-        // Copy everything from the end of where we applied the last hunk to the start of this hunk
-        for (var i_1 = minLine; i_1 < toPos; i_1++) {
-            resultLines.push(lines[i_1]);
-        }
-        // Add the lines produced by applying the hunk:
-        for (var i_2 = 0; i_2 < hunkResult.patchedLines.length; i_2++) {
-            var line = hunkResult.patchedLines[i_2];
-            resultLines.push(line);
-        }
-        // Set lower text limit to end of the current hunk, so next ones don't try
-        // to fit over already patched text
-        minLine = hunkResult.oldLineLastI + 1;
-        // Note the offset between where the patch said the hunk should've applied and where we
-        // applied it, so we can adjust future hunks accordingly:
-        prevHunkOffset = toPos + 1 - hunk.oldStart;
-    }
-    // Copy over the rest of the lines from the old text
-    for (var i = minLine; i < lines.length; i++) {
-        resultLines.push(lines[i]);
-    }
-    return resultLines.join('\n');
-}
-/**
- * applies one or more patches.
- *
- * `patch` may be either an array of structured patch objects, or a string representing a patch in unified diff format (which may patch one or more files).
- *
- * This method will iterate over the contents of the patch and apply to data provided through callbacks. The general flow for each patch index is:
- *
- * - `options.loadFile(index, callback)` is called. The caller should then load the contents of the file and then pass that to the `callback(err, data)` callback. Passing an `err` will terminate further patch execution.
- * - `options.patched(index, content, callback)` is called once the patch has been applied. `content` will be the return value from `applyPatch`. When it's ready, the caller should call `callback(err)` callback. Passing an `err` will terminate further patch execution.
- *
- * Once all patches have been applied or an error occurs, the `options.complete(err)` callback is made.
- */
-function applyPatches(uniDiff, options) {
-    var spDiff = typeof uniDiff === 'string' ? (0, parse_js_1.parsePatch)(uniDiff) : uniDiff;
-    var currentIndex = 0;
-    function processIndex() {
-        var index = spDiff[currentIndex++];
-        if (!index) {
-            return options.complete();
-        }
-        options.loadFile(index, function (err, data) {
-            if (err) {
-                return options.complete(err);
-            }
-            var updatedContent = applyPatch(data, index, options);
-            options.patched(index, updatedContent, function (err) {
-                if (err) {
-                    return options.complete(err);
-                }
-                processIndex();
-            });
-        });
-    }
-    processIndex();
-}
-
-
-/***/ }),
-
-/***/ 96284:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __assign = (this && this.__assign) || function () {
-    __assign = Object.assign || function(t) {
-        for (var s, i = 1, n = arguments.length; i < n; i++) {
-            s = arguments[i];
-            for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-                t[p] = s[p];
-        }
-        return t;
-    };
-    return __assign.apply(this, arguments);
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.OMIT_HEADERS = exports.FILE_HEADERS_ONLY = exports.INCLUDE_HEADERS = void 0;
-exports.structuredPatch = structuredPatch;
-exports.formatPatch = formatPatch;
-exports.createTwoFilesPatch = createTwoFilesPatch;
-exports.createPatch = createPatch;
-var line_js_1 = __nccwpck_require__(65945);
-exports.INCLUDE_HEADERS = {
-    includeIndex: true,
-    includeUnderline: true,
-    includeFileHeaders: true
-};
-exports.FILE_HEADERS_ONLY = {
-    includeIndex: false,
-    includeUnderline: false,
-    includeFileHeaders: true
-};
-exports.OMIT_HEADERS = {
-    includeIndex: false,
-    includeUnderline: false,
-    includeFileHeaders: false
-};
-function structuredPatch(oldFileName, newFileName, oldStr, newStr, oldHeader, newHeader, options) {
-    var optionsObj;
-    if (!options) {
-        optionsObj = {};
-    }
-    else if (typeof options === 'function') {
-        optionsObj = { callback: options };
-    }
-    else {
-        optionsObj = options;
-    }
-    if (typeof optionsObj.context === 'undefined') {
-        optionsObj.context = 4;
-    }
-    // We copy this into its own variable to placate TypeScript, which thinks
-    // optionsObj.context might be undefined in the callbacks below.
-    var context = optionsObj.context;
-    // @ts-expect-error (runtime check for something that is correctly a static type error)
-    if (optionsObj.newlineIsToken) {
-        throw new Error('newlineIsToken may not be used with patch-generation functions, only with diffing functions');
-    }
-    if (!optionsObj.callback) {
-        return diffLinesResultToPatch((0, line_js_1.diffLines)(oldStr, newStr, optionsObj));
-    }
-    else {
-        var callback_1 = optionsObj.callback;
-        (0, line_js_1.diffLines)(oldStr, newStr, __assign(__assign({}, optionsObj), { callback: function (diff) {
-                var patch = diffLinesResultToPatch(diff);
-                // TypeScript is unhappy without the cast because it does not understand that `patch` may
-                // be undefined here only if `callback` is StructuredPatchCallbackAbortable:
-                callback_1(patch);
-            } }));
-    }
-    function diffLinesResultToPatch(diff) {
-        // STEP 1: Build up the patch with no "\ No newline at end of file" lines and with the arrays
-        //         of lines containing trailing newline characters. We'll tidy up later...
-        if (!diff) {
-            return;
-        }
-        diff.push({ value: '', lines: [] }); // Append an empty value to make cleanup easier
-        function contextLines(lines) {
-            return lines.map(function (entry) { return ' ' + entry; });
-        }
-        var hunks = [];
-        var oldRangeStart = 0, newRangeStart = 0, curRange = [], oldLine = 1, newLine = 1;
-        for (var i = 0; i < diff.length; i++) {
-            var current = diff[i], lines = current.lines || splitLines(current.value);
-            current.lines = lines;
-            if (current.added || current.removed) {
-                // If we have previous context, start with that
-                if (!oldRangeStart) {
-                    var prev = diff[i - 1];
-                    oldRangeStart = oldLine;
-                    newRangeStart = newLine;
-                    if (prev) {
-                        curRange = context > 0 ? contextLines(prev.lines.slice(-context)) : [];
-                        oldRangeStart -= curRange.length;
-                        newRangeStart -= curRange.length;
-                    }
-                }
-                // Output our changes
-                for (var _i = 0, lines_1 = lines; _i < lines_1.length; _i++) {
-                    var line = lines_1[_i];
-                    curRange.push((current.added ? '+' : '-') + line);
-                }
-                // Track the updated file position
-                if (current.added) {
-                    newLine += lines.length;
-                }
-                else {
-                    oldLine += lines.length;
-                }
-            }
-            else {
-                // Identical context lines. Track line changes
-                if (oldRangeStart) {
-                    // Close out any changes that have been output (or join overlapping)
-                    if (lines.length <= context * 2 && i < diff.length - 2) {
-                        // Overlapping
-                        for (var _a = 0, _b = contextLines(lines); _a < _b.length; _a++) {
-                            var line = _b[_a];
-                            curRange.push(line);
-                        }
-                    }
-                    else {
-                        // end the range and output
-                        var contextSize = Math.min(lines.length, context);
-                        for (var _c = 0, _d = contextLines(lines.slice(0, contextSize)); _c < _d.length; _c++) {
-                            var line = _d[_c];
-                            curRange.push(line);
-                        }
-                        var hunk = {
-                            oldStart: oldRangeStart,
-                            oldLines: (oldLine - oldRangeStart + contextSize),
-                            newStart: newRangeStart,
-                            newLines: (newLine - newRangeStart + contextSize),
-                            lines: curRange
-                        };
-                        hunks.push(hunk);
-                        oldRangeStart = 0;
-                        newRangeStart = 0;
-                        curRange = [];
-                    }
-                }
-                oldLine += lines.length;
-                newLine += lines.length;
-            }
-        }
-        // Step 2: eliminate the trailing `\n` from each line of each hunk, and, where needed, add
-        //         "\ No newline at end of file".
-        for (var _e = 0, hunks_1 = hunks; _e < hunks_1.length; _e++) {
-            var hunk = hunks_1[_e];
-            for (var i = 0; i < hunk.lines.length; i++) {
-                if (hunk.lines[i].endsWith('\n')) {
-                    hunk.lines[i] = hunk.lines[i].slice(0, -1);
-                }
-                else {
-                    hunk.lines.splice(i + 1, 0, '\\ No newline at end of file');
-                    i++; // Skip the line we just added, then continue iterating
-                }
-            }
-        }
-        return {
-            oldFileName: oldFileName, newFileName: newFileName,
-            oldHeader: oldHeader, newHeader: newHeader,
-            hunks: hunks
-        };
-    }
-}
-/**
- * creates a unified diff patch.
- * @param patch either a single structured patch object (as returned by `structuredPatch`) or an array of them (as returned by `parsePatch`)
- */
-function formatPatch(patch, headerOptions) {
-    if (!headerOptions) {
-        headerOptions = exports.INCLUDE_HEADERS;
-    }
-    if (Array.isArray(patch)) {
-        if (patch.length > 1 && !headerOptions.includeFileHeaders) {
-            throw new Error('Cannot omit file headers on a multi-file patch. '
-                + '(The result would be unparseable; how would a tool trying to apply '
-                + 'the patch know which changes are to which file?)');
-        }
-        return patch.map(function (p) { return formatPatch(p, headerOptions); }).join('\n');
-    }
-    var ret = [];
-    if (headerOptions.includeIndex && patch.oldFileName == patch.newFileName) {
-        ret.push('Index: ' + patch.oldFileName);
-    }
-    if (headerOptions.includeUnderline) {
-        ret.push('===================================================================');
-    }
-    if (headerOptions.includeFileHeaders) {
-        ret.push('--- ' + patch.oldFileName + (typeof patch.oldHeader === 'undefined' ? '' : '\t' + patch.oldHeader));
-        ret.push('+++ ' + patch.newFileName + (typeof patch.newHeader === 'undefined' ? '' : '\t' + patch.newHeader));
-    }
-    for (var i = 0; i < patch.hunks.length; i++) {
-        var hunk = patch.hunks[i];
-        // Unified Diff Format quirk: If the chunk size is 0,
-        // the first number is one lower than one would expect.
-        // https://www.artima.com/weblogs/viewpost.jsp?thread=164293
-        if (hunk.oldLines === 0) {
-            hunk.oldStart -= 1;
-        }
-        if (hunk.newLines === 0) {
-            hunk.newStart -= 1;
-        }
-        ret.push('@@ -' + hunk.oldStart + ',' + hunk.oldLines
-            + ' +' + hunk.newStart + ',' + hunk.newLines
-            + ' @@');
-        for (var _i = 0, _a = hunk.lines; _i < _a.length; _i++) {
-            var line = _a[_i];
-            ret.push(line);
-        }
-    }
-    return ret.join('\n') + '\n';
-}
-function createTwoFilesPatch(oldFileName, newFileName, oldStr, newStr, oldHeader, newHeader, options) {
-    if (typeof options === 'function') {
-        options = { callback: options };
-    }
-    if (!(options === null || options === void 0 ? void 0 : options.callback)) {
-        var patchObj = structuredPatch(oldFileName, newFileName, oldStr, newStr, oldHeader, newHeader, options);
-        if (!patchObj) {
-            return;
-        }
-        return formatPatch(patchObj, options === null || options === void 0 ? void 0 : options.headerOptions);
-    }
-    else {
-        var callback_2 = options.callback;
-        structuredPatch(oldFileName, newFileName, oldStr, newStr, oldHeader, newHeader, __assign(__assign({}, options), { callback: function (patchObj) {
-                if (!patchObj) {
-                    callback_2(undefined);
-                }
-                else {
-                    callback_2(formatPatch(patchObj, options.headerOptions));
-                }
-            } }));
-    }
-}
-function createPatch(fileName, oldStr, newStr, oldHeader, newHeader, options) {
-    return createTwoFilesPatch(fileName, fileName, oldStr, newStr, oldHeader, newHeader, options);
-}
-/**
- * Split `text` into an array of lines, including the trailing newline character (where present)
- */
-function splitLines(text) {
-    var hasTrailingNl = text.endsWith('\n');
-    var result = text.split('\n').map(function (line) { return line + '\n'; });
-    if (hasTrailingNl) {
-        result.pop();
-    }
-    else {
-        result.push(result.pop().slice(0, -1));
-    }
-    return result;
-}
-
-
-/***/ }),
-
-/***/ 72591:
-/***/ (function(__unused_webpack_module, exports) {
-
-"use strict";
-
-var __assign = (this && this.__assign) || function () {
-    __assign = Object.assign || function(t) {
-        for (var s, i = 1, n = arguments.length; i < n; i++) {
-            s = arguments[i];
-            for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-                t[p] = s[p];
-        }
-        return t;
-    };
-    return __assign.apply(this, arguments);
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.unixToWin = unixToWin;
-exports.winToUnix = winToUnix;
-exports.isUnix = isUnix;
-exports.isWin = isWin;
-function unixToWin(patch) {
-    if (Array.isArray(patch)) {
-        // It would be cleaner if instead of the line below we could just write
-        //     return patch.map(unixToWin)
-        // but mysteriously TypeScript (v5.7.3 at the time of writing) does not like this and it will
-        // refuse to compile, thinking that unixToWin could then return StructuredPatch[][] and the
-        // result would be incompatible with the overload signatures.
-        // See bug report at https://github.com/microsoft/TypeScript/issues/61398.
-        return patch.map(function (p) { return unixToWin(p); });
-    }
-    return __assign(__assign({}, patch), { hunks: patch.hunks.map(function (hunk) { return (__assign(__assign({}, hunk), { lines: hunk.lines.map(function (line, i) {
-                var _a;
-                return (line.startsWith('\\') || line.endsWith('\r') || ((_a = hunk.lines[i + 1]) === null || _a === void 0 ? void 0 : _a.startsWith('\\')))
-                    ? line
-                    : line + '\r';
-            }) })); }) });
-}
-function winToUnix(patch) {
-    if (Array.isArray(patch)) {
-        // (See comment above equivalent line in unixToWin)
-        return patch.map(function (p) { return winToUnix(p); });
-    }
-    return __assign(__assign({}, patch), { hunks: patch.hunks.map(function (hunk) { return (__assign(__assign({}, hunk), { lines: hunk.lines.map(function (line) { return line.endsWith('\r') ? line.substring(0, line.length - 1) : line; }) })); }) });
-}
-/**
- * Returns true if the patch consistently uses Unix line endings (or only involves one line and has
- * no line endings).
- */
-function isUnix(patch) {
-    if (!Array.isArray(patch)) {
-        patch = [patch];
-    }
-    return !patch.some(function (index) { return index.hunks.some(function (hunk) { return hunk.lines.some(function (line) { return !line.startsWith('\\') && line.endsWith('\r'); }); }); });
-}
-/**
- * Returns true if the patch uses Windows line endings and only Windows line endings.
- */
-function isWin(patch) {
-    if (!Array.isArray(patch)) {
-        patch = [patch];
-    }
-    return patch.some(function (index) { return index.hunks.some(function (hunk) { return hunk.lines.some(function (line) { return line.endsWith('\r'); }); }); })
-        && patch.every(function (index) { return index.hunks.every(function (hunk) { return hunk.lines.every(function (line, i) { var _a; return line.startsWith('\\') || line.endsWith('\r') || ((_a = hunk.lines[i + 1]) === null || _a === void 0 ? void 0 : _a.startsWith('\\')); }); }); });
-}
-
-
-/***/ }),
-
-/***/ 51109:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.parsePatch = parsePatch;
-/**
- * Parses a patch into structured data, in the same structure returned by `structuredPatch`.
- *
- * @return a JSON object representation of the a patch, suitable for use with the `applyPatch` method.
- */
-function parsePatch(uniDiff) {
-    var diffstr = uniDiff.split(/\n/), list = [];
-    var i = 0;
-    function parseIndex() {
-        var index = {};
-        list.push(index);
-        // Parse diff metadata
-        while (i < diffstr.length) {
-            var line = diffstr[i];
-            // File header found, end parsing diff metadata
-            if ((/^(---|\+\+\+|@@)\s/).test(line)) {
-                break;
-            }
-            // Try to parse the line as a diff header, like
-            //     Index: README.md
-            // or
-            //     diff -r 9117c6561b0b -r 273ce12ad8f1 .hgignore
-            // or
-            //     Index: something with multiple words
-            // and extract the filename (or whatever else is used as an index name)
-            // from the end (i.e. 'README.md', '.hgignore', or
-            // 'something with multiple words' in the examples above).
-            //
-            // TODO: It seems awkward that we indiscriminately trim off trailing
-            //       whitespace here. Theoretically, couldn't that be meaningful -
-            //       e.g. if the patch represents a diff of a file whose name ends
-            //       with a space? Seems wrong to nuke it.
-            //       But this behaviour has been around since v2.2.1 in 2015, so if
-            //       it's going to change, it should be done cautiously and in a new
-            //       major release, for backwards-compat reasons.
-            //       -- ExplodingCabbage
-            var headerMatch = (/^(?:Index:|diff(?: -r \w+)+)\s+/).exec(line);
-            if (headerMatch) {
-                index.index = line.substring(headerMatch[0].length).trim();
-            }
-            i++;
-        }
-        // Parse file headers if they are defined. Unified diff requires them, but
-        // there's no technical issues to have an isolated hunk without file header
-        parseFileHeader(index);
-        parseFileHeader(index);
-        // Parse hunks
-        index.hunks = [];
-        while (i < diffstr.length) {
-            var line = diffstr[i];
-            if ((/^(Index:\s|diff\s|---\s|\+\+\+\s|===================================================================)/).test(line)) {
-                break;
-            }
-            else if ((/^@@/).test(line)) {
-                index.hunks.push(parseHunk());
-            }
-            else if (line) {
-                throw new Error('Unknown line ' + (i + 1) + ' ' + JSON.stringify(line));
-            }
-            else {
-                i++;
-            }
-        }
-    }
-    // Parses the --- and +++ headers, if none are found, no lines
-    // are consumed.
-    function parseFileHeader(index) {
-        var fileHeaderMatch = (/^(---|\+\+\+)\s+/).exec(diffstr[i]);
-        if (fileHeaderMatch) {
-            var prefix = fileHeaderMatch[1], data = diffstr[i].substring(3).trim().split('\t', 2), header = (data[1] || '').trim();
-            var fileName = data[0].replace(/\\\\/g, '\\');
-            if (fileName.startsWith('"') && fileName.endsWith('"')) {
-                fileName = fileName.substr(1, fileName.length - 2);
-            }
-            if (prefix === '---') {
-                index.oldFileName = fileName;
-                index.oldHeader = header;
-            }
-            else {
-                index.newFileName = fileName;
-                index.newHeader = header;
-            }
-            i++;
-        }
-    }
-    // Parses a hunk
-    // This assumes that we are at the start of a hunk.
-    function parseHunk() {
-        var _a;
-        var chunkHeaderIndex = i, chunkHeaderLine = diffstr[i++], chunkHeader = chunkHeaderLine.split(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-        var hunk = {
-            oldStart: +chunkHeader[1],
-            oldLines: typeof chunkHeader[2] === 'undefined' ? 1 : +chunkHeader[2],
-            newStart: +chunkHeader[3],
-            newLines: typeof chunkHeader[4] === 'undefined' ? 1 : +chunkHeader[4],
-            lines: []
-        };
-        // Unified Diff Format quirk: If the chunk size is 0,
-        // the first number is one lower than one would expect.
-        // https://www.artima.com/weblogs/viewpost.jsp?thread=164293
-        if (hunk.oldLines === 0) {
-            hunk.oldStart += 1;
-        }
-        if (hunk.newLines === 0) {
-            hunk.newStart += 1;
-        }
-        var addCount = 0, removeCount = 0;
-        for (; i < diffstr.length && (removeCount < hunk.oldLines || addCount < hunk.newLines || ((_a = diffstr[i]) === null || _a === void 0 ? void 0 : _a.startsWith('\\'))); i++) {
-            var operation = (diffstr[i].length == 0 && i != (diffstr.length - 1)) ? ' ' : diffstr[i][0];
-            if (operation === '+' || operation === '-' || operation === ' ' || operation === '\\') {
-                hunk.lines.push(diffstr[i]);
-                if (operation === '+') {
-                    addCount++;
-                }
-                else if (operation === '-') {
-                    removeCount++;
-                }
-                else if (operation === ' ') {
-                    addCount++;
-                    removeCount++;
-                }
-            }
-            else {
-                throw new Error("Hunk at line ".concat(chunkHeaderIndex + 1, " contained invalid line ").concat(diffstr[i]));
-            }
-        }
-        // Handle the empty block count case
-        if (!addCount && hunk.newLines === 1) {
-            hunk.newLines = 0;
-        }
-        if (!removeCount && hunk.oldLines === 1) {
-            hunk.oldLines = 0;
-        }
-        // Perform sanity checking
-        if (addCount !== hunk.newLines) {
-            throw new Error('Added line count did not match for hunk at line ' + (chunkHeaderIndex + 1));
-        }
-        if (removeCount !== hunk.oldLines) {
-            throw new Error('Removed line count did not match for hunk at line ' + (chunkHeaderIndex + 1));
-        }
-        return hunk;
-    }
-    while (i < diffstr.length) {
-        parseIndex();
-    }
-    return list;
-}
-
-
-/***/ }),
-
-/***/ 74984:
-/***/ (function(__unused_webpack_module, exports) {
-
-"use strict";
-
-var __assign = (this && this.__assign) || function () {
-    __assign = Object.assign || function(t) {
-        for (var s, i = 1, n = arguments.length; i < n; i++) {
-            s = arguments[i];
-            for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-                t[p] = s[p];
-        }
-        return t;
-    };
-    return __assign.apply(this, arguments);
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.reversePatch = reversePatch;
-function reversePatch(structuredPatch) {
-    if (Array.isArray(structuredPatch)) {
-        // (See comment in unixToWin for why we need the pointless-looking anonymous function here)
-        return structuredPatch.map(function (patch) { return reversePatch(patch); }).reverse();
-    }
-    return __assign(__assign({}, structuredPatch), { oldFileName: structuredPatch.newFileName, oldHeader: structuredPatch.newHeader, newFileName: structuredPatch.oldFileName, newHeader: structuredPatch.oldHeader, hunks: structuredPatch.hunks.map(function (hunk) {
-            return {
-                oldLines: hunk.newLines,
-                oldStart: hunk.newStart,
-                newLines: hunk.oldLines,
-                newStart: hunk.oldStart,
-                lines: hunk.lines.map(function (l) {
-                    if (l.startsWith('-')) {
-                        return "+".concat(l.slice(1));
-                    }
-                    if (l.startsWith('+')) {
-                        return "-".concat(l.slice(1));
-                    }
-                    return l;
-                })
-            };
-        }) });
-}
-
-
-/***/ }),
-
-/***/ 72724:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports["default"] = default_1;
-// Iterator that traverses in the range of [min, max], stepping
-// by distance from a given start position. I.e. for [0, 4], with
-// start of 2, this will iterate 2, 3, 1, 4, 0.
-function default_1(start, minLine, maxLine) {
-    var wantForward = true, backwardExhausted = false, forwardExhausted = false, localOffset = 1;
-    return function iterator() {
-        if (wantForward && !forwardExhausted) {
-            if (backwardExhausted) {
-                localOffset++;
-            }
-            else {
-                wantForward = false;
-            }
-            // Check if trying to fit beyond text length, and if not, check it fits
-            // after offset location (or desired location on first iteration)
-            if (start + localOffset <= maxLine) {
-                return start + localOffset;
-            }
-            forwardExhausted = true;
-        }
-        if (!backwardExhausted) {
-            if (!forwardExhausted) {
-                wantForward = true;
-            }
-            // Check if trying to fit before text beginning, and if not, check it fits
-            // before offset location
-            if (minLine <= start - localOffset) {
-                return start - localOffset++;
-            }
-            backwardExhausted = true;
-            return iterator();
-        }
-        // We tried to fit hunk before text beginning and beyond text length, then
-        // hunk can't fit on the text. Return undefined
-        return undefined;
-    };
-}
-
-
-/***/ }),
-
-/***/ 62160:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.generateOptions = generateOptions;
-function generateOptions(options, defaults) {
-    if (typeof options === 'function') {
-        defaults.callback = options;
-    }
-    else if (options) {
-        for (var name in options) {
-            /* istanbul ignore else */
-            if (Object.prototype.hasOwnProperty.call(options, name)) {
-                defaults[name] = options[name];
-            }
-        }
-    }
-    return defaults;
-}
-
-
-/***/ }),
-
-/***/ 22943:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.longestCommonPrefix = longestCommonPrefix;
-exports.longestCommonSuffix = longestCommonSuffix;
-exports.replacePrefix = replacePrefix;
-exports.replaceSuffix = replaceSuffix;
-exports.removePrefix = removePrefix;
-exports.removeSuffix = removeSuffix;
-exports.maximumOverlap = maximumOverlap;
-exports.hasOnlyWinLineEndings = hasOnlyWinLineEndings;
-exports.hasOnlyUnixLineEndings = hasOnlyUnixLineEndings;
-exports.segment = segment;
-exports.trailingWs = trailingWs;
-exports.leadingWs = leadingWs;
-exports.leadingAndTrailingWs = leadingAndTrailingWs;
-function longestCommonPrefix(str1, str2) {
-    var i;
-    for (i = 0; i < str1.length && i < str2.length; i++) {
-        if (str1[i] != str2[i]) {
-            return str1.slice(0, i);
-        }
-    }
-    return str1.slice(0, i);
-}
-function longestCommonSuffix(str1, str2) {
-    var i;
-    // Unlike longestCommonPrefix, we need a special case to handle all scenarios
-    // where we return the empty string since str1.slice(-0) will return the
-    // entire string.
-    if (!str1 || !str2 || str1[str1.length - 1] != str2[str2.length - 1]) {
-        return '';
-    }
-    for (i = 0; i < str1.length && i < str2.length; i++) {
-        if (str1[str1.length - (i + 1)] != str2[str2.length - (i + 1)]) {
-            return str1.slice(-i);
-        }
-    }
-    return str1.slice(-i);
-}
-function replacePrefix(string, oldPrefix, newPrefix) {
-    if (string.slice(0, oldPrefix.length) != oldPrefix) {
-        throw Error("string ".concat(JSON.stringify(string), " doesn't start with prefix ").concat(JSON.stringify(oldPrefix), "; this is a bug"));
-    }
-    return newPrefix + string.slice(oldPrefix.length);
-}
-function replaceSuffix(string, oldSuffix, newSuffix) {
-    if (!oldSuffix) {
-        return string + newSuffix;
-    }
-    if (string.slice(-oldSuffix.length) != oldSuffix) {
-        throw Error("string ".concat(JSON.stringify(string), " doesn't end with suffix ").concat(JSON.stringify(oldSuffix), "; this is a bug"));
-    }
-    return string.slice(0, -oldSuffix.length) + newSuffix;
-}
-function removePrefix(string, oldPrefix) {
-    return replacePrefix(string, oldPrefix, '');
-}
-function removeSuffix(string, oldSuffix) {
-    return replaceSuffix(string, oldSuffix, '');
-}
-function maximumOverlap(string1, string2) {
-    return string2.slice(0, overlapCount(string1, string2));
-}
-// Nicked from https://stackoverflow.com/a/60422853/1709587
-function overlapCount(a, b) {
-    // Deal with cases where the strings differ in length
-    var startA = 0;
-    if (a.length > b.length) {
-        startA = a.length - b.length;
-    }
-    var endB = b.length;
-    if (a.length < b.length) {
-        endB = a.length;
-    }
-    // Create a back-reference for each index
-    //   that should be followed in case of a mismatch.
-    //   We only need B to make these references:
-    var map = Array(endB);
-    var k = 0; // Index that lags behind j
-    map[0] = 0;
-    for (var j = 1; j < endB; j++) {
-        if (b[j] == b[k]) {
-            map[j] = map[k]; // skip over the same character (optional optimisation)
-        }
-        else {
-            map[j] = k;
-        }
-        while (k > 0 && b[j] != b[k]) {
-            k = map[k];
-        }
-        if (b[j] == b[k]) {
-            k++;
-        }
-    }
-    // Phase 2: use these references while iterating over A
-    k = 0;
-    for (var i = startA; i < a.length; i++) {
-        while (k > 0 && a[i] != b[k]) {
-            k = map[k];
-        }
-        if (a[i] == b[k]) {
-            k++;
-        }
-    }
-    return k;
-}
-/**
- * Returns true if the string consistently uses Windows line endings.
- */
-function hasOnlyWinLineEndings(string) {
-    return string.includes('\r\n') && !string.startsWith('\n') && !string.match(/[^\r]\n/);
-}
-/**
- * Returns true if the string consistently uses Unix line endings.
- */
-function hasOnlyUnixLineEndings(string) {
-    return !string.includes('\r\n') && string.includes('\n');
-}
-/**
- * Split a string into segments using a word segmenter, merging consecutive
- * segments if they are both whitespace segments. Whitespace segments can
- * appear adjacent to one another for two reasons:
- * - newlines always get their own segment
- * - where a diacritic is attached to a whitespace character in the text, the
- *   segment ends after the diacritic, so e.g. " \u0300 " becomes two segments.
- * This function therefore runs the segmenter's .segment() method and then
- * merges consecutive segments of whitespace into a single part.
- */
-function segment(string, segmenter) {
-    var parts = [];
-    for (var _i = 0, _a = Array.from(segmenter.segment(string)); _i < _a.length; _i++) {
-        var segmentObj = _a[_i];
-        var segment_1 = segmentObj.segment;
-        if (parts.length && (/\s/).test(parts[parts.length - 1]) && (/\s/).test(segment_1)) {
-            parts[parts.length - 1] += segment_1;
-        }
-        else {
-            parts.push(segment_1);
-        }
-    }
-    return parts;
-}
-// The functions below take a `segmenter` argument so that, when called from
-// diffWords when it is using a segmenter, they can use a notion of what
-// constitutes "whitespace" that is consistent with the segmenter.
-//
-// USUALLY this will be identical to the result of the non-segmenter-based
-// logic, but it differs in at least one case: when whitespace characters are
-// modified by diacritics. A word segmenter considers these diacritics to be
-// part of the whitespace, whereas our non-segmenter-based logic does not.
-//
-// Because the segmenter-based approach necessarily requires segmenting the
-// entire string, we offer a leadingAndTrailingWs function to allow getting the
-// whitespace prefix AND whitespace suffix with a single call to the segmenter,
-// for efficiency's sake.
-function trailingWs(string, segmenter) {
-    if (segmenter) {
-        return leadingAndTrailingWs(string, segmenter)[1];
-    }
-    // Yes, this looks overcomplicated and dumb - why not replace the whole function with
-    //     return string.match(/\s*$/)[0]
-    // you ask? Because:
-    // 1. the trap described at https://markamery.com/blog/quadratic-time-regexes/ would mean doing
-    //    this would cause this function to take O(n²) time in the worst case (specifically when
-    //    there is a massive run of NON-TRAILING whitespace in `string`), and
-    // 2. the fix proposed in the same blog post, of using a negative lookbehind, is incompatible
-    //    with old Safari versions that we'd like to not break if possible (see
-    //    https://github.com/kpdecker/jsdiff/pull/550)
-    // It feels absurd to do this with an explicit loop instead of a regex, but I really can't see a
-    // better way that doesn't result in broken behaviour.
-    var i;
-    for (i = string.length - 1; i >= 0; i--) {
-        if (!string[i].match(/\s/)) {
-            break;
-        }
-    }
-    return string.substring(i + 1);
-}
-function leadingWs(string, segmenter) {
-    if (segmenter) {
-        return leadingAndTrailingWs(string, segmenter)[0];
-    }
-    // Thankfully the annoying considerations described in trailingWs don't apply here:
-    var match = string.match(/^\s*/);
-    return match ? match[0] : '';
-}
-function leadingAndTrailingWs(string, segmenter) {
-    if (!segmenter) {
-        return [leadingWs(string), trailingWs(string)];
-    }
-    if (segmenter.resolvedOptions().granularity != 'word') {
-        throw new Error('The segmenter passed must have a granularity of "word"');
-    }
-    var segments = segment(string, segmenter);
-    var firstSeg = segments[0];
-    var lastSeg = segments[segments.length - 1];
-    var head = (/\s/).test(firstSeg) ? firstSeg : '';
-    var tail = (/\s/).test(lastSeg) ? lastSeg : '';
-    return [head, tail];
-}
-
 
 /***/ }),
 
@@ -107787,7 +105237,7 @@ exports.JSONPath = JSONPath;
 /***/ ((module) => {
 
 "use strict";
-module.exports = {"rE":"17.6.0"};
+module.exports = {"rE":"17.11.2"};
 
 /***/ }),
 
@@ -107795,7 +105245,7 @@ module.exports = {"rE":"17.6.0"};
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"$schema":"http://json-schema.org/draft-07/schema#","title":"release-please manifest config schema","description":"Schema for defining manifest config file","type":"object","additionalProperties":false,"definitions":{"ReleaserConfigOptions":{"type":"object","properties":{"release-type":{"description":"The strategy to use for this component.","type":"string"},"bump-minor-pre-major":{"description":"Breaking changes only bump semver minor if version < 1.0.0","type":"boolean"},"bump-patch-for-minor-pre-major":{"description":"Feature changes only bump semver patch if version < 1.0.0","type":"boolean"},"prerelease-type":{"description":"Configuration option for the prerelease versioning strategy. If prerelease strategy used and type set, will set the prerelease part of the version to the provided value in case prerelease part is not present.","type":"string"},"versioning":{"description":"Versioning strategy. Defaults to `default`","type":"string"},"changelog-sections":{"description":"Override the Changelog configuration sections","type":"array","items":{"type":"object","properties":{"type":{"description":"Semantic commit type (e.g. `feat`, `chore`)","type":"string"},"section":{"description":"Changelog section title","type":"string"},"hidden":{"description":"Skip displaying this type of commit. Defaults to `false`.","type":"boolean"}},"required":["type","section"]}},"release-as":{"description":"[DEPRECATED] Override the next version of this package. Consider using a `Release-As` commit instead.","type":"string"},"skip-github-release":{"description":"Skip tagging GitHub releases for this package. Release-Please still requires releases to be tagged, so this option should only be used if you have existing infrastructure to tag these releases.Defaults to `false`.","type":"boolean"},"skip-changelog":{"description":"Skip generating a changelog for this package. Defaults to `false`.","type":"boolean"},"draft":{"description":"Create the GitHub release in draft mode. Defaults to `false`.","type":"boolean"},"force-tag-creation":{"description":"Force the creation of a Git tag for the release. This is particularly useful when `draft` is enabled, because GitHub does not create a Git tag for draft releases until they are published. This \'lazy tag creation\' causes release-please to fail to find the previous release, potentially generating incorrect changelogs. Setting this to `true` ensures the tag is created immediately. Defaults to `false`.","type":"boolean"},"annotated-tag":{"description":"Create an annotated tag instead of a lightweight tag when creating a release. Annotated tags store additional metadata like the tagger and message. According to Git\'s documentation, release tags should be annotated. Defaults to `false` for historical and backwards compatibility reasons.","type":"boolean"},"prerelease":{"description":"Create the GitHub release as prerelease. Defaults to `false`.","type":"boolean"},"draft-pull-request":{"description":"Open the release pull request in draft mode. Defaults to `false`.","type":"boolean"},"extra-label":{"description":"Comma-separated list of labels to add to a newly opened pull request","type":"string"},"include-component-in-tag":{"description":"When tagging a release, include the component name as part of the tag. Defaults to `true`.","type":"boolean"},"include-v-in-tag":{"description":"When tagging a release, include `v` in the tag. Defaults to `true`.","type":"boolean"},"include-v-in-release-name":{"description":"Include `v` in the GitHub release name. Defaults to `true`.","type":"boolean"},"changelog-type":{"description":"The type of changelog to use. Defaults to `default`.","type":"string","enum":["default","github"]},"changelog-host":{"description":"Generate changelog links to this GitHub host. Useful for running against GitHub Enterprise.","type":"string"},"changelog-path":{"description":"Path to the file that tracks release note changes. Defaults to `CHANGELOG.md`.","type":"string"},"pull-request-title-pattern":{"description":"Customize the release pull request title.","type":"string"},"pull-request-header":{"description":"Customize the release pull request header.","type":"string"},"pull-request-footer":{"description":"Customize the release pull request footer.","type":"string"},"separate-pull-requests":{"description":"Open a separate release pull request for each component. Defaults to `false`.","type":"boolean"},"always-update":{"description":"Always update the pull request with the latest changes. Defaults to `false`.","type":"boolean"},"tag-separator":{"description":"Customize the separator between the component and version in the GitHub tag.","type":"string"},"date-format":{"description":"Date format given as a strftime expression for the generic strategy.","type":"string"},"extra-files":{"description":"Specify extra generic files to replace versions.","type":"array","items":{"anyOf":[{"description":"The path to the file. The `Generic` updater uses annotations to replace versions.","type":"string"},{"description":"An extra JSON, YAML, or TOML file with a targeted update via jsonpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["json","toml","yaml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"jsonpath":{"description":"The jsonpath to the version entry in the file.","type":"string"}},"required":["type","path","jsonpath"]},{"description":"An extra XML file with a targeted update via xpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["xml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"xpath":{"description":"The xpath to the version entry in the file.","type":"string"}},"required":["type","path","xpath"]},{"description":"An extra pom.xml file.","type":"object","properties":{"type":{"description":"The file format type.","enum":["pom"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]},{"description":"An extra arbitrary file that includes release-please generic updater\'s annotation.","type":"object","properties":{"type":{"description":"The file format type.","enum":["generic"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]}]}},"exclude-paths":{"description":"Path of commits to be excluded from parsing. If all files from commit belong to one of the paths it will be skipped","type":"array","items":{"type":"string"}},"version-file":{"description":"Path to the specialize version file. Used by `ruby` and `simple` strategies.","type":"string"},"snapshot-label":{"description":"Label to add to snapshot pull request. Used by `java` strategies.","type":"string"},"skip-snapshot":{"description":"If set, do not propose snapshot pull requests. Used by `java` strategies.","type":"boolean"},"initial-version":{"description":"Releases the initial library with a specified version","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}}}},"allOf":[{"$ref":"#/definitions/ReleaserConfigOptions"},{"properties":{"$schema":{"description":"Path to the release-please manifest config schema","type":"string","format":"uri-reference"},"packages":{"description":"Per-path component configuration.","type":"object","additionalProperties":{"$ref":"#/definitions/ReleaserConfigOptions"}},"bootstrap-sha":{"description":"For the initial release of a library, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"last-release-sha":{"description":"For any release, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"always-link-local":{"description":"When using the `node-workspace` plugin, force all local dependencies to be linked.","type":"boolean"},"plugins":{"description":"Plugins to apply to pull requests. Plugins can be added to perform extra release processing that cannot be achieved by an individual release strategy.","type":"array","items":{"anyOf":[{"description":"The plugin name for plugins that do not require other options.","type":"string"},{"description":"Configuration for the `linked-versions` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["linked-versions"]},"groupName":{"description":"The name of the group of components.","type":"string"},"components":{"description":"List of component names that are part of this group.","type":"array","items":{"type":"string"}},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"specialWords":{"description":"Words that sentence casing logic will not be applied to","type":"array","items":{"type":"string"}}},"required":["type","groupName","components"]},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["cargo-workspace","maven-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"}}},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["node-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"},"updatePeerDependencies":{"description":"Also bump peer dependency versions if they are modified. Defaults to `false`.","type":"boolean"}}},{"description":"Configuration for various `group-priority` plugin","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["group-priority"]},"groups":{"description":"Group names ordered with highest priority first.","type":"array","items":{"type":"string"}}}},{"description":"Other plugins","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string"}}}]}},"signoff":{"description":"Text to be used as Signed-off-by in the commit.","type":"string"},"group-pull-request-title-pattern":{"description":"When grouping multiple release pull requests use this pattern for the title.","type":"string"},"release-search-depth":{"description":"When considering previously releases, only look this deep.","type":"number"},"commit-search-depth":{"description":"When considering commit history, only look this many commits deep.","type":"number"},"commit-batch-size":{"description":"Number of commits to fetch per API request when searching commit history. Lower values result in more API calls but may help avoid timeouts. Defaults to 10.","type":"number"},"sequential-calls":{"description":"Whether to open pull requests/releases sequentially rather than concurrently. If you have many components, you may want to set this to avoid secondary rate limits.","type":"boolean"},"label":{"description":"Comma-separated list of labels to add to newly opened pull request. These are used to identify release pull requests.","type":"string"},"release-label":{"description":"Comma-separated list of labels to add to a pull request that has been released/tagged","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}},"required":["packages"]}],"properties":{"$schema":true,"packages":true,"bootstrap-sha":true,"last-release-sha":true,"always-link-local":true,"plugins":true,"signoff":true,"group-pull-request-title-pattern":true,"release-search-depth":true,"commit-search-depth":true,"commit-batch-size":true,"sequential-calls":true,"release-type":true,"bump-minor-pre-major":true,"bump-patch-for-minor-pre-major":true,"versioning":true,"changelog-sections":true,"release-as":true,"skip-github-release":true,"skip-changelog":true,"draft":true,"force-tag-creation":true,"prerelease":true,"draft-pull-request":true,"label":true,"release-label":true,"extra-label":true,"include-component-in-tag":true,"include-v-in-tag":true,"include-v-in-release-name":true,"changelog-type":true,"changelog-host":true,"changelog-path":true,"pull-request-title-pattern":true,"pull-request-header":true,"pull-request-footer":true,"separate-pull-requests":true,"always-update":true,"tag-separator":true,"date-format":true,"extra-files":true,"version-file":true,"snapshot-label":true,"initial-version":true,"exclude-paths":true,"component-no-space":false}}');
+module.exports = /*#__PURE__*/JSON.parse('{"$schema":"http://json-schema.org/draft-07/schema#","title":"release-please manifest config schema","description":"Schema for defining manifest config file","type":"object","additionalProperties":false,"definitions":{"ReleaserConfigOptions":{"type":"object","properties":{"release-type":{"description":"The strategy to use for this component.","type":"string"},"bump-minor-pre-major":{"description":"Breaking changes only bump semver minor if version < 1.0.0","type":"boolean"},"bump-patch-for-minor-pre-major":{"description":"Feature changes only bump semver patch if version < 1.0.0","type":"boolean"},"prerelease-type":{"description":"Configuration option for the prerelease versioning strategy. If prerelease strategy used and type set, will set the prerelease part of the version to the provided value in case prerelease part is not present.","type":"string"},"versioning":{"description":"Versioning strategy. Defaults to `default`","type":"string"},"changelog-sections":{"description":"Override the Changelog configuration sections","type":"array","items":{"type":"object","properties":{"type":{"description":"Semantic commit type (e.g. `feat`, `chore`)","type":"string"},"section":{"description":"Changelog section title","type":"string"},"hidden":{"description":"Skip displaying this type of commit. Defaults to `false`.","type":"boolean"}},"required":["type","section"]}},"release-as":{"description":"[DEPRECATED] Override the next version of this package. Consider using a `Release-As` commit instead.","type":"string"},"skip-github-release":{"description":"Skip tagging GitHub releases for this package. Release-Please still requires releases to be tagged, so this option should only be used if you have existing infrastructure to tag these releases.Defaults to `false`.","type":"boolean"},"skip-changelog":{"description":"Skip generating a changelog for this package. Defaults to `false`.","type":"boolean"},"draft":{"description":"Create the GitHub release in draft mode. Defaults to `false`.","type":"boolean"},"force-tag-creation":{"description":"Force the creation of a Git tag for the release. This is particularly useful when `draft` is enabled, because GitHub does not create a Git tag for draft releases until they are published. This \'lazy tag creation\' causes release-please to fail to find the previous release, potentially generating incorrect changelogs. Setting this to `true` ensures the tag is created immediately. Defaults to `false`.","type":"boolean"},"annotated-tag":{"description":"Create an annotated tag instead of a lightweight tag when creating a release. Annotated tags store additional metadata like the tagger and message. According to Git\'s documentation, release tags should be annotated. Defaults to `true`; set to `false` to fall back to the lightweight tag the GitHub Releases API creates.","type":"boolean"},"prerelease":{"description":"Create the GitHub release as prerelease. Defaults to `false`.","type":"boolean"},"draft-pull-request":{"description":"Open the release pull request in draft mode. Defaults to `false`.","type":"boolean"},"extra-label":{"description":"Comma-separated list of labels to add to a newly opened pull request","type":"string"},"include-component-in-tag":{"description":"When tagging a release, include the component name as part of the tag. Defaults to `true`.","type":"boolean"},"include-v-in-tag":{"description":"When tagging a release, include `v` in the tag. Defaults to `true`.","type":"boolean"},"include-v-in-release-name":{"description":"Include `v` in the GitHub release name. Defaults to `true`.","type":"boolean"},"changelog-type":{"description":"The type of changelog to use. Defaults to `default`.","type":"string","enum":["default","github"]},"changelog-host":{"description":"Generate changelog links to this GitHub host. Useful for running against GitHub Enterprise.","type":"string"},"changelog-path":{"description":"Path to the file that tracks release note changes. Defaults to `CHANGELOG.md`.","type":"string"},"pull-request-title-pattern":{"description":"Customize the release pull request title.","type":"string"},"pull-request-header":{"description":"Customize the release pull request header.","type":"string"},"pull-request-footer":{"description":"Customize the release pull request footer.","type":"string"},"separate-pull-requests":{"description":"Open a separate release pull request for each component. Defaults to `false`.","type":"boolean"},"always-update":{"description":"Always update the pull request with the latest changes. Defaults to `false`.","type":"boolean"},"tag-separator":{"description":"Customize the separator between the component and version in the GitHub tag.","type":"string"},"date-format":{"description":"Date format given as a strftime expression for the generic strategy.","type":"string"},"extra-files":{"description":"Specify extra generic files to replace versions.","type":"array","items":{"anyOf":[{"description":"The path to the file. The `Generic` updater uses annotations to replace versions.","type":"string"},{"description":"An extra JSON, YAML, or TOML file with a targeted update via jsonpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["json","toml","yaml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"jsonpath":{"description":"The jsonpath to the version entry in the file.","type":"string"}},"required":["type","path","jsonpath"]},{"description":"An extra XML file with a targeted update via xpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["xml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"xpath":{"description":"The xpath to the version entry in the file.","type":"string"}},"required":["type","path","xpath"]},{"description":"An extra pom.xml file.","type":"object","properties":{"type":{"description":"The file format type.","enum":["pom"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]},{"description":"An extra arbitrary file that includes release-please generic updater\'s annotation.","type":"object","properties":{"type":{"description":"The file format type.","enum":["generic"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]}]}},"exclude-paths":{"description":"Path of commits to be excluded from parsing. If all files from commit belong to one of the paths it will be skipped","type":"array","items":{"type":"string"}},"version-file":{"description":"Path to the specialize version file. Used by `ruby` and `simple` strategies.","type":"string"},"snapshot-label":{"description":"Label to add to snapshot pull request. Used by `java` strategies.","type":"string"},"skip-snapshot":{"description":"If set, do not propose snapshot pull requests. Used by `java` strategies.","type":"boolean"},"initial-version":{"description":"Releases the initial library with a specified version","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}}}},"allOf":[{"$ref":"#/definitions/ReleaserConfigOptions"},{"properties":{"$schema":{"description":"Path to the release-please manifest config schema","type":"string","format":"uri-reference"},"packages":{"description":"Per-path component configuration.","type":"object","additionalProperties":{"$ref":"#/definitions/ReleaserConfigOptions"}},"bootstrap-sha":{"description":"For the initial release of a library, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"last-release-sha":{"description":"For any release, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"always-link-local":{"description":"When using the `node-workspace` plugin, force all local dependencies to be linked.","type":"boolean"},"plugins":{"description":"Plugins to apply to pull requests. Plugins can be added to perform extra release processing that cannot be achieved by an individual release strategy.","type":"array","items":{"anyOf":[{"description":"The plugin name for plugins that do not require other options.","type":"string"},{"description":"Configuration for the `linked-versions` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["linked-versions"]},"groupName":{"description":"The name of the group of components.","type":"string"},"components":{"description":"List of component names that are part of this group.","type":"array","items":{"type":"string"}},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"specialWords":{"description":"Words that sentence casing logic will not be applied to","type":"array","items":{"type":"string"}}},"required":["type","groupName","components"]},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["cargo-workspace","maven-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"}}},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["node-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"},"updatePeerDependencies":{"description":"Also bump peer dependency versions if they are modified. Defaults to `false`.","type":"boolean"}}},{"description":"Configuration for various `group-priority` plugin","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["group-priority"]},"groups":{"description":"Group names ordered with highest priority first.","type":"array","items":{"type":"string"}}}},{"description":"Other plugins","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string"}}}]}},"signoff":{"description":"Text to be used as Signed-off-by in the commit.","type":"string"},"group-pull-request-title-pattern":{"description":"When grouping multiple release pull requests use this pattern for the title.","type":"string"},"release-search-depth":{"description":"When considering previously releases, only look this deep.","type":"number"},"commit-search-depth":{"description":"When considering commit history, only look this many commits deep.","type":"number"},"commit-batch-size":{"description":"Number of commits to fetch per API request when searching commit history. Lower values result in more API calls but may help avoid timeouts. Defaults to 10.","type":"number"},"sequential-calls":{"description":"Whether to open pull requests/releases sequentially rather than concurrently. If you have many components, you may want to set this to avoid secondary rate limits.","type":"boolean"},"label":{"description":"Comma-separated list of labels to add to newly opened pull request. These are used to identify release pull requests.","type":"string"},"release-label":{"description":"Comma-separated list of labels to add to a pull request that has been released/tagged","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}},"required":["packages"]}],"properties":{"$schema":true,"packages":true,"bootstrap-sha":true,"last-release-sha":true,"always-link-local":true,"plugins":true,"signoff":true,"group-pull-request-title-pattern":true,"release-search-depth":true,"commit-search-depth":true,"commit-batch-size":true,"sequential-calls":true,"release-type":true,"bump-minor-pre-major":true,"bump-patch-for-minor-pre-major":true,"versioning":true,"changelog-sections":true,"release-as":true,"skip-github-release":true,"skip-changelog":true,"draft":true,"force-tag-creation":true,"annotated-tag":true,"prerelease":true,"draft-pull-request":true,"label":true,"release-label":true,"extra-label":true,"include-component-in-tag":true,"include-v-in-tag":true,"include-v-in-release-name":true,"changelog-type":true,"changelog-host":true,"changelog-path":true,"pull-request-title-pattern":true,"pull-request-header":true,"pull-request-footer":true,"separate-pull-requests":true,"always-update":true,"tag-separator":true,"date-format":true,"extra-files":true,"version-file":true,"snapshot-label":true,"initial-version":true,"exclude-paths":true,"component-no-space":false}}');
 
 /***/ }),
 
