@@ -42914,6 +42914,12 @@ class GitHub {
                   }
                   sha: oid
                   message
+                  parents(first: 10) {
+                    totalCount
+                    nodes {
+                      oid
+                    }
+                  }
                   author {
                     name
                     email
@@ -42972,6 +42978,7 @@ class GitHub {
             const commit = {
                 sha: graphCommit.sha,
                 message: graphCommit.message,
+                parents: parentShas(graphCommit),
                 author: graphCommit.author
                     ? {
                         name: graphCommit.author.name || 'Unknown',
@@ -43400,6 +43407,17 @@ const wrapAsync = (fn, errorHandler) => {
 };
 const sleepInMs = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 exports.sleepInMs = sleepInMs;
+/**
+ * The commit's parent SHAs, or `undefined` when the query returned only
+ * some of them, so that callers treat its ancestry as unknown.
+ */
+function parentShas(commit) {
+    const parents = commit.parents;
+    if (!parents || parents.nodes.length < parents.totalCount) {
+        return undefined;
+    }
+    return parents.nodes.map(node => node.oid);
+}
 //# sourceMappingURL=github.js.map
 
 /***/ }),
@@ -43486,6 +43504,7 @@ const errors_1 = __nccwpck_require__(88302);
 const pull_request_overflow_handler_1 = __nccwpck_require__(4611);
 const signoff_commit_message_1 = __nccwpck_require__(38895);
 const commit_exclude_1 = __nccwpck_require__(58163);
+const release_ancestry_1 = __nccwpck_require__(24732);
 exports.DEFAULT_RELEASE_PLEASE_CONFIG = 'release-please-config.json';
 exports.DEFAULT_RELEASE_PLEASE_MANIFEST = '.release-please-manifest.json';
 exports.ROOT_PROJECT_PATH = '.';
@@ -43648,7 +43667,7 @@ class Manifest {
      * @returns {ReleasePullRequest[]} The candidate pull requests to open or update.
      */
     async buildPullRequests() {
-        var _a;
+        var _a, _b;
         this.logger.info('Building pull requests');
         const pathsByComponent = await this.getPathsByComponent();
         const strategiesByPath = await this.getStrategiesByPath();
@@ -43730,10 +43749,17 @@ class Manifest {
         const releaseShas = new Set(Object.values(releaseShasByPath));
         this.logger.debug(releaseShas);
         const expectedShas = releaseShas.size;
+        // History arrives in committer-date order, so reaching every release
+        // commit does not mean every unreleased commit has been seen.
+        const ancestry = new release_ancestry_1.ReleaseAncestry(releaseShas);
         // sha => release pull request
         const releasePullRequestsBySha = {};
         let releaseCommitsFound = 0;
         for await (const commit of commitGenerator) {
+            // Judge before the visit: this commit is still in the frontier, so an
+            // unreleased commit keeps the walk going until it is collected.
+            const unreleasedRemain = !ancestry.isComplete();
+            ancestry.visit(commit);
             if (releaseShas.has(commit.sha)) {
                 if (commit.pullRequest) {
                     releasePullRequestsBySha[commit.sha] = commit.pullRequest;
@@ -43751,7 +43777,9 @@ class Manifest {
                 this.logger.info(`Needed bootstrapping, found configured bootstrapSha ${this.bootstrapSha}`);
                 break;
             }
-            else if (!needsBootstrap && releaseCommitsFound >= expectedShas) {
+            else if (!needsBootstrap &&
+                releaseCommitsFound >= expectedShas &&
+                !unreleasedRemain) {
                 // found enough commits
                 break;
             }
@@ -43761,6 +43789,7 @@ class Manifest {
                 files: commit.files,
                 pullRequest: commit.pullRequest,
                 author: commit.author,
+                parents: commit.parents,
             });
         }
         if (releaseCommitsFound < expectedShas) {
@@ -43773,10 +43802,18 @@ class Manifest {
             packagePaths: Object.keys(this.repositoryConfig),
         });
         const splitCommits = cs.split(commits);
-        // limit paths to ones since the last release
+        // limit paths to ones since the last release. Filter by ancestry only
+        // when the walk resolved it; a walk that stopped early (configured last
+        // release, bootstrap, search depth) keeps the date-order cutoff.
+        const ancestryResolved = ancestry.isComplete();
         let commitsPerPath = {};
         for (const path in this.repositoryConfig) {
-            commitsPerPath[path] = commitsAfterSha(path === exports.ROOT_PROJECT_PATH ? commits : splitCommits[path], releaseShasByPath[path]);
+            const pathCommits = path === exports.ROOT_PROJECT_PATH ? commits : (_a = splitCommits[path]) !== null && _a !== void 0 ? _a : [];
+            const unreleased = ancestryResolved
+                ? ancestry.notReleasedBy(pathCommits, releaseShasByPath[path])
+                : undefined;
+            commitsPerPath[path] =
+                unreleased !== null && unreleased !== void 0 ? unreleased : commitsAfterSha(pathCommits, releaseShasByPath[path]);
         }
         const commitExclude = new commit_exclude_1.CommitExclude(this.repositoryConfig);
         commitsPerPath = commitExclude.excludeCommits(commitsPerPath);
@@ -43821,7 +43858,7 @@ class Manifest {
             }
             const strategy = strategies[path];
             const latestRelease = releasesByPath[path];
-            const releasePullRequest = await strategy.buildReleasePullRequest(pathCommits, latestRelease, (_a = config.draftPullRequest) !== null && _a !== void 0 ? _a : this.draftPullRequest, this.labels);
+            const releasePullRequest = await strategy.buildReleasePullRequest(pathCommits, latestRelease, (_b = config.draftPullRequest) !== null && _b !== void 0 ? _b : this.draftPullRequest, this.labels);
             if (releasePullRequest) {
                 // Update manifest, but only for valid release version - this will skip SNAPSHOT from java strategy
                 if (releasePullRequest.version &&
@@ -55376,6 +55413,156 @@ class PullRequestTitle {
 }
 exports.PullRequestTitle = PullRequestTitle;
 //# sourceMappingURL=pull-request-title.js.map
+
+/***/ }),
+
+/***/ 24732:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReleaseAncestry = void 0;
+/**
+ * Tracks which walked commits each release already contains.
+ *
+ * Commit history arrives newest committer date first, not in graph order.
+ * A branch cut before a release and merged after it keeps its older dates,
+ * so its commits sort behind the release commit. Stopping at the release
+ * commit drops them (googleapis/release-please#2883). Feed every walked
+ * commit to `visit`; `isComplete` says when no unwalked commit can be
+ * missing from a release and every walked commit can be classified, and
+ * `notReleasedBy` filters a walked list down to what a given release does
+ * not contain.
+ *
+ * When any walked commit lacks `parents`, ancestry is unknown: `isComplete`
+ * is always true and `notReleasedBy` returns `undefined`, so callers keep
+ * the date-order behavior.
+ */
+class ReleaseAncestry {
+    constructor(releaseShas) {
+        this.tracking = true;
+        // Walked commit SHA => its parent SHAs.
+        this.parentsOf = new Map();
+        // Commits known to be reachable from the walk's head, through walked edges.
+        this.reached = new Set();
+        // Reached commits that have not been walked yet.
+        this.frontier = new Set();
+        // Walked commits not yet linked to the head. Skewed dates can sort a
+        // commit ahead of every child that leads to it, so until one is walked
+        // nobody can say which releases contain it.
+        this.unlinked = new Set();
+        // Release SHA => the release commit and every ancestor found so far.
+        this.contained = new Map();
+        for (const sha of releaseShas) {
+            this.contained.set(sha, new Set([sha]));
+        }
+    }
+    visit(commit) {
+        const parents = commit.parents;
+        if (!parents) {
+            this.tracking = false;
+            return;
+        }
+        const isHead = this.parentsOf.size === 0;
+        this.parentsOf.set(commit.sha, parents);
+        this.frontier.delete(commit.sha);
+        if (isHead || this.reached.has(commit.sha)) {
+            this.reached.add(commit.sha);
+            this.reach(parents);
+        }
+        else {
+            this.unlinked.add(commit.sha);
+        }
+        for (const ancestors of this.contained.values()) {
+            if (ancestors.has(commit.sha)) {
+                this.contain(ancestors, parents);
+            }
+        }
+    }
+    // Mark `shas` reached and, through edges already walked, their ancestors.
+    reach(shas) {
+        const pending = [...shas];
+        for (let sha = pending.pop(); sha !== undefined; sha = pending.pop()) {
+            if (this.reached.has(sha)) {
+                continue;
+            }
+            this.reached.add(sha);
+            const parents = this.parentsOf.get(sha);
+            if (parents) {
+                this.unlinked.delete(sha);
+                pending.push(...parents);
+            }
+            else {
+                this.frontier.add(sha);
+            }
+        }
+    }
+    // Add `shas` and, through edges already walked, their ancestors. Dates
+    // can be skewed, so a parent may have been walked before its child.
+    contain(ancestors, shas) {
+        var _a;
+        const pending = [...shas];
+        for (let sha = pending.pop(); sha !== undefined; sha = pending.pop()) {
+            if (ancestors.has(sha)) {
+                continue;
+            }
+            ancestors.add(sha);
+            pending.push(...((_a = this.parentsOf.get(sha)) !== null && _a !== void 0 ? _a : []));
+        }
+    }
+    /**
+     * True once every walked commit is linked to the head and every unwalked
+     * commit reachable from the head is contained in every release, so
+     * walking further can find nothing unreleased and every walked commit can
+     * be classified.
+     */
+    isComplete() {
+        if (!this.tracking) {
+            return true;
+        }
+        if (this.unlinked.size > 0) {
+            return false;
+        }
+        for (const sha of this.frontier) {
+            for (const ancestors of this.contained.values()) {
+                if (!ancestors.has(sha)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    /**
+     * The commits that the release at `releaseSha` does not contain, or
+     * `undefined` when ancestry is unknown.
+     */
+    notReleasedBy(commits, releaseSha) {
+        if (!this.tracking) {
+            return undefined;
+        }
+        const ancestors = releaseSha ? this.contained.get(releaseSha) : undefined;
+        if (!ancestors) {
+            return commits;
+        }
+        return commits.filter(commit => !ancestors.has(commit.sha));
+    }
+}
+exports.ReleaseAncestry = ReleaseAncestry;
+//# sourceMappingURL=release-ancestry.js.map
 
 /***/ }),
 
