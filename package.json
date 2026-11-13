@@ -52,12 +52,6 @@
     "@google-automations/git-file-utils": {
       "minimatch": "^11.0.1"
     },
-    "glob": {
-      "minimatch": "^11.0.1"
-    },
-    "mocha": {
-      "minimatch": "^11.0.1"
-    },
     "serialize-javascript": "^7.1.3",
     "tmp": "^0.2.6"
   }
