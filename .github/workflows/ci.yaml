@@ -5,6 +5,8 @@ on:
   pull_request:
   merge_group:
 name: ci
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -47,4 +49,13 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci
+      # Build into an empty dist, so a tracked file the build no longer
+      # writes shows up as deleted.
+      - run: rm -rf dist
       - run: npm run build
+      # Fail when the committed bundle differs from a fresh build, so a
+      # reviewer can trust dist without reading the generated diff.
+      - name: Check that dist matches the build
+        run: |
+          git status --porcelain -- dist
+          test -z "$(git status --porcelain -- dist)"
