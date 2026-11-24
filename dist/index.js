@@ -42911,9 +42911,92 @@ const github_api_1 = __nccwpck_require__(57424);
 const signoff_commit_message_1 = __nccwpck_require__(38895);
 const git_file_utils_1 = __nccwpck_require__(7735);
 const composite_1 = __nccwpck_require__(85608);
+// The commit fields every commit query selects, so that commits read from
+// history and commits fetched by SHA convert the same way.
+const COMMIT_FIELDS = `fragment CommitFields on Commit {
+  associatedPullRequests(first: 10) {
+    nodes {
+      number
+      title
+      baseRefName
+      headRefName
+      labels(first: 10) {
+        nodes {
+          name
+        }
+      }
+      body
+      mergeCommit {
+        oid
+      }
+      files(first: $maxFilesChanged) {
+        nodes {
+          path
+        }
+        pageInfo {
+          endCursor
+          hasNextPage
+        }
+      }
+    }
+  }
+  sha: oid
+  message
+  committedDate
+  parents(first: 10) {
+    totalCount
+    nodes {
+      oid
+    }
+  }
+  author {
+    name
+    email
+    user {
+      login
+    }
+  }
+}`;
 class GitHub {
     constructor(options) {
         var _a;
+        /**
+         * The SHAs of the commits reachable from `headSha` but not from `baseSha`
+         * (`git log baseSha..headSha`), from the compare API.
+         *
+         * @param {string} baseSha The commit to exclude, with its ancestors
+         * @param {string} headSha The commit to start from
+         * @param {number} maxResults The most commits to list
+         * @returns {string[] | undefined} The SHAs, oldest first, or `undefined`
+         *   when there are more than `maxResults` or the comparison is incomplete
+         * @throws {GitHubAPIError} on an API error
+         */
+        this.commitShasBetween = wrapAsync(async (baseSha, headSha, maxResults) => {
+            this.logger.debug(`Comparing commits ${baseSha}...${headSha}`);
+            const shas = [];
+            const perPage = 100;
+            for (let page = 1;; page++) {
+                const { data } = await this.octokit.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
+                    owner: this.repository.owner,
+                    repo: this.repository.repo,
+                    basehead: `${baseSha}...${headSha}`,
+                    per_page: perPage,
+                    page,
+                });
+                if (data.total_commits > maxResults) {
+                    this.logger.warn(`${data.total_commits} commits since ${baseSha}, more than ${maxResults}`);
+                    return undefined;
+                }
+                shas.push(...data.commits.map(commit => commit.sha));
+                if (shas.length >= data.total_commits) {
+                    return shas;
+                }
+                if (data.commits.length < perPage) {
+                    this.logger.warn(`Compare listed ${shas.length} of ${data.total_commits} commits since ${baseSha}`);
+                    return undefined;
+                }
+            }
+        });
         /**
          * Get the list of file paths modified in a given commit.
          *
@@ -43128,8 +43211,7 @@ class GitHub {
         }
     }
     async mergeCommitsGraphQL(targetBranch, cursor, options = {}) {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
-        var _l;
+        var _a, _b;
         this.logger.debug(`Fetching merge commits on branch ${targetBranch} with cursor: ${cursor}`);
         const query = `query pullRequestsSince($owner: String!, $repo: String!, $num: Int!, $maxFilesChanged: Int, $targetBranch: String!, $cursor: String) {
       repository(owner: $owner, name: $repo) {
@@ -43138,47 +43220,7 @@ class GitHub {
             ... on Commit {
               history(first: $num, after: $cursor) {
                 nodes {
-                  associatedPullRequests(first: 10) {
-                    nodes {
-                      number
-                      title
-                      baseRefName
-                      headRefName
-                      labels(first: 10) {
-                        nodes {
-                          name
-                        }
-                      }
-                      body
-                      mergeCommit {
-                        oid
-                      }
-                      files(first: $maxFilesChanged) {
-                        nodes {
-                          path
-                        }
-                        pageInfo {
-                          endCursor
-                          hasNextPage
-                        }
-                      }
-                    }
-                  }
-                  sha: oid
-                  message
-                  parents(first: 10) {
-                    totalCount
-                    nodes {
-                      oid
-                    }
-                  }
-                  author {
-                    name
-                    email
-                    user {
-                      login
-                    }
-                  }
+                  ...CommitFields
                 }
                 pageInfo {
                   hasNextPage
@@ -43189,7 +43231,8 @@ class GitHub {
           }
         }
       }
-    }`;
+    }
+    ${COMMIT_FIELDS}`;
         const params = {
             cursor,
             owner: this.repository.owner,
@@ -43212,15 +43255,27 @@ class GitHub {
             return null;
         }
         const history = response.repository.ref.target.history;
-        const commits = (history.nodes || []);
+        const commitData = await this.toCommits((history.nodes || []), options);
+        return {
+            pageInfo: history.pageInfo,
+            data: commitData,
+        };
+    }
+    // Convert GraphQL commits, matching each to its pull request and filling in
+    // its files. A page of history holds every commit a rebase merge landed,
+    // so the count below can tell a single-commit pull request; commits
+    // fetched by SHA (`fromHistory` false) cannot, so they always backfill.
+    async toCommits(commits, options, fromHistory = true) {
+        var _a, _b, _c, _d, _e, _f, _g, _h;
+        var _j;
         // Count the number of pull requests associated with each merge commit. This is
         // used in the next step to make sure we only find pull requests with a
         // merge commit that contain 1 merged commit.
         const mergeCommitCount = {};
         for (const commit of commits) {
             for (const pr of commit.associatedPullRequests.nodes) {
-                if ((_c = pr.mergeCommit) === null || _c === void 0 ? void 0 : _c.oid) {
-                    (_d = mergeCommitCount[_l = pr.mergeCommit.oid]) !== null && _d !== void 0 ? _d : (mergeCommitCount[_l] = 0);
+                if ((_a = pr.mergeCommit) === null || _a === void 0 ? void 0 : _a.oid) {
+                    (_b = mergeCommitCount[_j = pr.mergeCommit.oid]) !== null && _b !== void 0 ? _b : (mergeCommitCount[_j] = 0);
                     mergeCommitCount[pr.mergeCommit.oid]++;
                 }
             }
@@ -43235,7 +43290,7 @@ class GitHub {
                     ? {
                         name: graphCommit.author.name || 'Unknown',
                         email: graphCommit.author.email,
-                        username: (_e = graphCommit.author.user) === null || _e === void 0 ? void 0 : _e.login,
+                        username: (_c = graphCommit.author.user) === null || _c === void 0 ? void 0 : _c.login,
                     }
                     : undefined,
             };
@@ -43258,15 +43313,15 @@ class GitHub {
                     number: pullRequest.number,
                     baseBranchName: pullRequest.baseRefName,
                     headBranchName: pullRequest.headRefName,
-                    mergeCommitOid: (_f = pullRequest.mergeCommit) === null || _f === void 0 ? void 0 : _f.oid,
+                    mergeCommitOid: (_d = pullRequest.mergeCommit) === null || _d === void 0 ? void 0 : _d.oid,
                     title: pullRequest.title,
                     body: pullRequest.body,
                     labels: pullRequest.labels.nodes.map(node => node.name),
-                    files: (((_g = pullRequest.files) === null || _g === void 0 ? void 0 : _g.nodes) || []).map(node => node.path),
+                    files: (((_e = pullRequest.files) === null || _e === void 0 ? void 0 : _e.nodes) || []).map(node => node.path),
                 };
             }
-            if (mergePullRequest) {
-                if (((_j = (_h = mergePullRequest.files) === null || _h === void 0 ? void 0 : _h.pageInfo) === null || _j === void 0 ? void 0 : _j.hasNextPage) &&
+            if (mergePullRequest && fromHistory) {
+                if (((_g = (_f = mergePullRequest.files) === null || _f === void 0 ? void 0 : _f.pageInfo) === null || _g === void 0 ? void 0 : _g.hasNextPage) &&
                     options.backfillFiles) {
                     this.logger.info(`PR #${mergePullRequest.number} has many files, backfilling`);
                     commit.files = await this.getCommitFiles(graphCommit.sha);
@@ -43274,7 +43329,7 @@ class GitHub {
                 else {
                     // We cannot directly fetch files on commits via graphql, only provide file
                     // information for commits with associated pull requests
-                    commit.files = (((_k = mergePullRequest.files) === null || _k === void 0 ? void 0 : _k.nodes) || []).map(node => node.path);
+                    commit.files = (((_h = mergePullRequest.files) === null || _h === void 0 ? void 0 : _h.nodes) || []).map(node => node.path);
                 }
             }
             else if (options.backfillFiles) {
@@ -43286,10 +43341,50 @@ class GitHub {
             }
             commitData.push(commit);
         }
-        return {
-            pageInfo: history.pageInfo,
-            data: commitData,
-        };
+        return commitData;
+    }
+    /**
+     * Fetch commits by SHA, converted the same way as commits read from
+     * history.
+     *
+     * @param {string[]} shas The commits to fetch
+     * @param {CommitIteratorOptions} options Query options
+     * @param {boolean} options.backfillFiles If set, use the REST API for
+     *   fetching the list of touched files in each commit.
+     * @param {number} options.batchSize How many commits each query fetches
+     * @returns {Commit[]} The commits found, newest first by committer date,
+     *   the order history is read in
+     * @throws {GitHubAPIError} on an API error
+     */
+    async commitsBySha(shas, options = {}) {
+        var _a;
+        const batchSize = (_a = options.batchSize) !== null && _a !== void 0 ? _a : 10;
+        const found = [];
+        for (let i = 0; i < shas.length; i += batchSize) {
+            const batch = shas.slice(i, i + batchSize);
+            this.logger.debug(`Fetching ${batch.length} commits by SHA`);
+            const variables = batch.map((_sha, j) => `$sha${j}: GitObjectID!`);
+            const aliases = batch.map((_sha, j) => `c${j}: object(oid: $sha${j}) { ...CommitFields }`);
+            const query = `query commitsBySha($owner: String!, $repo: String!, $maxFilesChanged: Int, ${variables.join(', ')}) {
+        repository(owner: $owner, name: $repo) {
+          ${aliases.join('\n')}
+        }
+      }
+      ${COMMIT_FIELDS}`;
+            const response = await this.graphqlRequest({
+                query,
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                maxFilesChanged: 100,
+                ...Object.fromEntries(batch.map((sha, j) => [`sha${j}`, sha])),
+            });
+            found.push(...batch
+                .map((_sha, j) => { var _a; return (_a = response === null || response === void 0 ? void 0 : response.repository) === null || _a === void 0 ? void 0 : _a[`c${j}`]; })
+                .filter(Boolean));
+        }
+        // GitHub returns UTC ISO 8601 timestamps, which sort as strings.
+        found.sort((a, b) => { var _a, _b; return ((_a = b.committedDate) !== null && _a !== void 0 ? _a : '').localeCompare((_b = a.committedDate) !== null && _b !== void 0 ? _b : ''); });
+        return this.toCommits(found, options, false);
     }
     /**
      * Iterate through merged pull requests with a max number of results scanned.
@@ -43919,7 +44014,7 @@ class Manifest {
      * @returns {ReleasePullRequest[]} The candidate pull requests to open or update.
      */
     async buildPullRequests() {
-        var _a, _b;
+        var _a, _b, _c;
         this.logger.info('Building pull requests');
         const pathsByComponent = await this.getPathsByComponent();
         const strategiesByPath = await this.getStrategiesByPath();
@@ -44004,13 +44099,35 @@ class Manifest {
         // History arrives in committer-date order, so reaching every release
         // commit does not mean every unreleased commit has been seen.
         const ancestry = new release_ancestry_1.ReleaseAncestry(releaseShas);
+        // Release SHA => the commits it does not contain, compared from the head
+        // the walk starts at. Proving ancestry by walking can take far more
+        // commits than the search depth: a branch cut long before the last
+        // release keeps its old dates, and only reading back to its branch point
+        // shows that it is not in the release.
+        let unreleasedByRelease;
+        // Unreleased commits the walk has not reached yet.
+        const unwalked = new Set();
+        const canCompare = !needsBootstrap && !this.lastReleaseSha && releaseShas.size > 0;
         // sha => release pull request
         const releasePullRequestsBySha = {};
         let releaseCommitsFound = 0;
+        let isHead = true;
         for await (const commit of commitGenerator) {
-            // Judge before the visit: this commit is still in the frontier, so an
+            if (isHead) {
+                isHead = false;
+                unreleasedByRelease = canCompare
+                    ? await this.compareReleases(releaseShas, commit.sha)
+                    : undefined;
+                for (const shas of (_a = unreleasedByRelease === null || unreleasedByRelease === void 0 ? void 0 : unreleasedByRelease.values()) !== null && _a !== void 0 ? _a : []) {
+                    shas.forEach(sha => unwalked.add(sha));
+                }
+            }
+            // Judge before the visit: this commit is still unwalked, so an
             // unreleased commit keeps the walk going until it is collected.
-            const unreleasedRemain = !ancestry.isComplete();
+            const unreleasedRemain = unreleasedByRelease
+                ? unwalked.size > 0
+                : !ancestry.isComplete();
+            unwalked.delete(commit.sha);
             ancestry.visit(commit);
             if (releaseShas.has(commit.sha)) {
                 if (commit.pullRequest) {
@@ -44047,6 +44164,32 @@ class Manifest {
         if (releaseCommitsFound < expectedShas) {
             this.logger.warn(`Expected ${expectedShas} commits, only found ${releaseCommitsFound}`);
         }
+        // Fetch the unreleased commits the search depth stopped the walk short
+        // of. They are older than every walked commit, so they go last, newest
+        // first as fetched.
+        if (unwalked.size > 0 && this.github.commitsBySha) {
+            this.logger.info(`Fetching ${unwalked.size} unreleased commits beyond the search depth`);
+            const late = await this.github.commitsBySha([...unwalked], {
+                backfillFiles: true,
+                batchSize: this.commitBatchSize,
+            });
+            // A release built without them gets the wrong version and notes, and
+            // a tag cannot be taken back, so fail instead.
+            late.forEach(commit => unwalked.delete(commit.sha));
+            if (unwalked.size > 0) {
+                throw new Error(`Could not fetch unreleased commits: ${[...unwalked].join(', ')}`);
+            }
+            for (const commit of late) {
+                commits.push({
+                    sha: commit.sha,
+                    message: commit.message,
+                    files: commit.files,
+                    pullRequest: commit.pullRequest,
+                    author: commit.author,
+                    parents: commit.parents,
+                });
+            }
+        }
         // split commits by path
         this.logger.info(`Splitting ${commits.length} commits by path`);
         const cs = new commit_split_1.CommitSplit({
@@ -44054,16 +44197,20 @@ class Manifest {
             packagePaths: Object.keys(this.repositoryConfig),
         });
         const splitCommits = cs.split(commits);
-        // limit paths to ones since the last release. Filter by ancestry only
-        // when the walk resolved it; a walk that stopped early (configured last
-        // release, bootstrap, search depth) keeps the date-order cutoff.
+        // limit paths to ones since the last release. Without a comparison,
+        // filter by ancestry only when the walk resolved it; a walk that stopped
+        // early (configured last release, bootstrap, search depth) keeps the
+        // date-order cutoff.
         const ancestryResolved = ancestry.isComplete();
         let commitsPerPath = {};
         for (const path in this.repositoryConfig) {
-            const pathCommits = path === exports.ROOT_PROJECT_PATH ? commits : (_a = splitCommits[path]) !== null && _a !== void 0 ? _a : [];
-            const unreleased = ancestryResolved
-                ? ancestry.notReleasedBy(pathCommits, releaseShasByPath[path])
-                : undefined;
+            const pathCommits = path === exports.ROOT_PROJECT_PATH ? commits : (_b = splitCommits[path]) !== null && _b !== void 0 ? _b : [];
+            const releaseSha = releaseShasByPath[path];
+            const unreleased = unreleasedByRelease
+                ? notReleasedPerComparison(pathCommits, unreleasedByRelease, releaseSha)
+                : ancestryResolved
+                    ? ancestry.notReleasedBy(pathCommits, releaseSha)
+                    : undefined;
             commitsPerPath[path] =
                 unreleased !== null && unreleased !== void 0 ? unreleased : commitsAfterSha(pathCommits, releaseShasByPath[path]);
         }
@@ -44110,7 +44257,7 @@ class Manifest {
             }
             const strategy = strategies[path];
             const latestRelease = releasesByPath[path];
-            const releasePullRequest = await strategy.buildReleasePullRequest(pathCommits, latestRelease, (_b = config.draftPullRequest) !== null && _b !== void 0 ? _b : this.draftPullRequest, this.labels);
+            const releasePullRequest = await strategy.buildReleasePullRequest(pathCommits, latestRelease, (_c = config.draftPullRequest) !== null && _c !== void 0 ? _c : this.draftPullRequest, this.labels);
             if (releasePullRequest) {
                 // Update manifest, but only for valid release version - this will skip SNAPSHOT from java strategy
                 if (releasePullRequest.version &&
@@ -44213,6 +44360,35 @@ class Manifest {
             allTags[tag.name] = tag;
         }
         return allTags;
+    }
+    /**
+     * For each release, the SHAs of the commits reachable from `headSha` that
+     * it does not contain, or `undefined` when any comparison is unavailable.
+     */
+    async compareReleases(releaseShas, headSha) {
+        if (!this.github.commitShasBetween || !this.github.commitsBySha) {
+            return undefined;
+        }
+        const unreleasedByRelease = new Map();
+        for (const releaseSha of releaseShas) {
+            let shas;
+            try {
+                shas = await this.github.commitShasBetween(releaseSha, headSha, this.commitSearchDepth);
+            }
+            catch (e) {
+                if (!(e instanceof errors_1.GitHubAPIError)) {
+                    throw e;
+                }
+                this.logger.warn(`Compare failed: ${e.message}`);
+            }
+            if (!shas) {
+                this.logger.warn(`Could not compare ${releaseSha}...${headSha}, judging releases from the commit walk`);
+                return undefined;
+            }
+            this.logger.info(`Found ${shas.length} commits since release ${releaseSha}`);
+            unreleasedByRelease.set(releaseSha, shas);
+        }
+        return unreleasedByRelease;
     }
     /**
      * Opens/updates all candidate release pull requests for this repository.
@@ -44885,6 +45061,20 @@ function hasAllLabels(expected, existing) {
         }
     }
     return true;
+}
+/**
+ * The commits the release at `releaseSha` does not contain, per the
+ * comparison. With no release, every commit is unreleased.
+ */
+function notReleasedPerComparison(commits, unreleasedByRelease, releaseSha) {
+    const unreleased = releaseSha
+        ? unreleasedByRelease.get(releaseSha)
+        : undefined;
+    if (!unreleased) {
+        return commits;
+    }
+    const shas = new Set(unreleased);
+    return commits.filter(commit => shas.has(commit.sha));
 }
 function commitsAfterSha(commits, lastReleaseSha) {
     if (!commits) {
