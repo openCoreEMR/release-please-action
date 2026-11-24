@@ -48,3 +48,9 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm ci
       - run: npm run build
+      # Fail when the committed bundle differs from a fresh build, so a
+      # reviewer can trust dist without reading the generated diff.
+      - name: Check that dist matches the build
+        run: |
+          git add --intent-to-add dist
+          git diff --exit-code --stat -- dist
